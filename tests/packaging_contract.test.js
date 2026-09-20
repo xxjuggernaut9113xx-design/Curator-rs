@@ -50,7 +50,9 @@ test('release workflow builds native Windows and Linux binaries without browser 
   assert.match(workflow, /validate:/);
   assert.match(workflow, /windows:/);
   assert.match(workflow, /linux:/);
-  assert.match(workflow, /cargo build --release --locked --bin/);
+  assert.match(workflow, /cargo build -vv --release --locked -p \$\{\{ matrix\.package \}\} --bin/);
+  assert.match(workflow, /RUST_LOG: debug/);
+  assert.match(workflow, /RUST_BACKTRACE: full/);
   assert.doesNotMatch(workflow, /tauri|webkit|macos/i);
   assert.equal(fs.existsSync(path.join(root, '.github/workflows/windows-release.yml')), false);
 });

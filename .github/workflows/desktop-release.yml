@@ -10,6 +10,14 @@ on:
 permissions:
   contents: read
 
+# Preserve diagnostics from native builds and startup smoke tests. Curator's
+# runtime logger honours RUST_LOG and already defaults to debug for local use;
+# setting it here makes CI failures self-contained in the Actions log.
+env:
+  RUST_LOG: debug
+  RUST_BACKTRACE: full
+  CARGO_TERM_COLOR: always
+
 jobs:
   validate:
     runs-on: ubuntu-22.04
@@ -38,16 +46,26 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        binary: [curator, Curator, curator-viewer]
+        include:
+          - package: curator
+            binary: curator
+            artifact: curator.exe
+          - package: curator-desktop
+            binary: Curator
+            artifact: Curator.exe
+          - package: curator-viewer
+            binary: curator-viewer
+            artifact: curator-viewer.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --bin ${{ matrix.binary }}
+      - name: Build ${{ matrix.binary }} with verbose diagnostics
+        run: cargo build -vv --release --locked -p ${{ matrix.package }} --bin ${{ matrix.binary }}
       - uses: actions/upload-artifact@v4
         with:
           name: curator-windows-${{ matrix.binary }}
-          path: target/release/${{ matrix.binary }}.exe
+          path: target/release/${{ matrix.artifact }}
 
   linux:
     needs: validate
@@ -58,7 +76,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential libfontconfig1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libfuse2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --workspace
+      - name: Build native editions with verbose diagnostics
+        run: cargo build -vv --release --locked --workspace
       - uses: actions/upload-artifact@v4
         with:
           name: curator-linux-native
