@@ -2,7 +2,7 @@
 
 // The original app remains Curator's media and playback engine. This adapter
 // replaces its surrounding surface with a single Explorer-style library so
-// existing downloads, media URLs, lightbox, feed, and Tauri protocol paths
+// existing downloads, media URLs, lightbox, and feed paths remain intact.
 // remain intact.
 
 const explorerLegacy = {
@@ -13,6 +13,11 @@ const explorerLegacy = {
   populateTagFilterOptions,
   exitSlideshow,
 };
+
+// This browser-only fallback uses ordinary same-origin HTTP. Native Host and
+// Viewer implementations call typed Rust clients instead of injecting a web
+// bridge into this page.
+const curatorRuntime = 'browser';
 
 const explorer = {
   installed: false,
@@ -44,9 +49,6 @@ function normalizePlayMode(mode) {
 }
 
 function supportsPlayMode(mode) {
-  // Host is a native desktop app. Its panorama fallback is available without
-  // an attached headset, so VR must remain a visible Play choice there.
-  if (mode === 'vr' && curatorRuntime === 'host') return true;
   const narrowOrCoarse = window.matchMedia('(max-width: 900px), (pointer: coarse)').matches;
   const wideFine = window.matchMedia('(min-width: 901px) and (pointer: fine)').matches;
   if (mode === 'feed') return narrowOrCoarse;

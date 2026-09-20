@@ -25,81 +25,16 @@ test('the browser fallback boots Explorer after the legacy media engine', () => 
   assert.doesNotMatch(app, /CLIP_MAX_SECONDS|THREE/);
 });
 
-test('the desktop OOBE loads its API bridge before the wizard code', () => {
+test('the browser OOBE loads its wizard directly', () => {
   const html = read('static/oobe.html');
-  assert.match(
-    html,
-    /<script src="\/desktop\.js"><\/script>\s*<script src="\/oobe\.js"><\/script>/,
-  );
+  assert.match(html, /<script src="\/oobe\.js"><\/script>/);
+  assert.doesNotMatch(html, /desktop\.js/);
   assert.doesNotThrow(() => new vm.Script(read('static/oobe.js'), { filename: 'static/oobe.js' }));
 });
 
-test('the desktop bridge sends OOBE API requests through Tauri', async () => {
-  const payload = { settings: { theme: 'system' } };
-  let invocation;
-  const context = {
-    Response,
-    Uint8Array,
-    MutationObserver: class {
-      observe() {}
-    },
-    document: {
-      documentElement: {},
-      addEventListener() {},
-    },
-    navigator: { userAgent: 'Windows' },
-  };
-  context.window = {
-    __CURATOR_RUNTIME__: 'host',
-    __TAURI__: {
-      core: {
-        invoke: async (...args) => {
-          invocation = args;
-          return {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-            body: [...Buffer.from(JSON.stringify(payload))],
-          };
-        },
-      },
-      event: { listen: async () => {} },
-    },
-    fetch: async () => { throw new Error('relative API requests must use the desktop bridge'); },
-  };
-  context.window.window = context.window;
-
-  new vm.Script(read('static/desktop.js'), { filename: 'static/desktop.js' }).runInNewContext(context);
-  const response = await context.window.fetch('/api/oobe/status');
-  assert.deepEqual(await response.json(), payload);
-  assert.equal(invocation[0], 'api_request');
-  assert.equal(invocation[1].path, '/api/oobe/status');
-  assert.equal(invocation[1].method, 'GET');
-  assert.equal(invocation[1].body, null);
-
-  assert.equal(typeof context.window.curatorNative.importLocalFolder, 'function');
-  await context.window.curatorNative.mediaAction(42, 'reveal');
-  assert.equal(invocation[0], 'media_action');
-  assert.equal(invocation[1].id, 42);
-  assert.equal(invocation[1].action, 'reveal');
-});
-
-test('the Viewer runtime never receives Host-native file capabilities', () => {
-  const context = {
-    Response,
-    Uint8Array,
-    MutationObserver: class { observe() {} },
-    document: { documentElement: {}, addEventListener() {} },
-    navigator: { userAgent: 'Windows' },
-  };
-  context.window = {
-    __CURATOR_RUNTIME__: 'remote',
-    __TAURI__: { core: { invoke: async () => { throw new Error('must not invoke'); } }, event: { listen: async () => {} } },
-    fetch: async () => new Response('{}'),
-  };
-  context.window.window = context.window;
-
-  new vm.Script(read('static/desktop.js'), { filename: 'static/desktop.js' }).runInNewContext(context);
-  assert.equal(context.window.curatorNative, undefined);
+test('browser fallback contains no desktop bridge', () => {
+  assert.equal(fs.existsSync(path.join(root, 'static', 'desktop.js')), false);
+  assert.doesNotMatch(read('static/index.html'), /desktop\.js/);
 });
 
 test('packaged browser assets parse and do not depend on remote UI libraries', () => {
@@ -108,10 +43,8 @@ test('packaged browser assets parse and do not depend on remote UI libraries', (
   assert.doesNotMatch(html, /fonts\.googleapis\.com|fonts\.gstatic\.com|threejs|cdnjs|unpkg/i);
   assert.doesNotMatch(styles, /url\(\s*https?:\/\//i);
 
-  for (const file of ['static/desktop.js', 'static/oobe.js', 'static/virtual-clips.js', 'static/app.js', 'static/library.js']) {
+  for (const file of ['static/oobe.js', 'static/virtual-clips.js', 'static/app.js', 'static/library.js']) {
     assert.doesNotThrow(() => new vm.Script(read(file), { filename: file }));
   }
-  assert.match(read('static/desktop.js'), /window\.curatorNative = Object\.freeze/);
-  assert.match(read('static/app.js'), /function nativeMediaAction\(action\)/);
   assert.match(read('static/library.js'), /function goonRecordTimingCorrection\(session, kind\)/);
 });

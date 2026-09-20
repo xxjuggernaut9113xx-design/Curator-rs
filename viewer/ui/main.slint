@@ -1,0 +1,23 @@
+import { Button, LineEdit, VerticalBox } from "std-widgets.slint";
+
+export component CuratorViewerWindow inherits Window {
+    in-out property <string> host-name: "My Curator";
+    in-out property <string> endpoint: "http://";
+    in-out property <string> status: "Choose a Tailnet host.";
+    callback connect(string, string);
+    title: "Curator Viewer";
+    preferred-width: 760px; preferred-height: 500px; min-width: 560px; min-height: 400px;
+    VerticalBox {
+        padding: 24px; spacing: 14px;
+        Text { text: "Curator Viewer"; font-size: 28px; font-weight: 700; }
+        Text { text: "Connect to a saved Curator Host or Server on your Tailnet."; wrap: word-wrap; }
+        Text { text: "Host name"; }
+        LineEdit { text <=> root.host-name; }
+        Text { text: "Tailnet origin"; }
+        LineEdit { text <=> root.endpoint; }
+        Button { text: "Validate and connect"; clicked => { root.connect(root.host-name, root.endpoint); } }
+        Rectangle { vertical-stretch: 1; horizontal-stretch: 1; border-width: 1px; border-color: #5b6474; border-radius: 8px;
+            Text { text: root.status; color: #d5dced; wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+}

@@ -9,31 +9,12 @@ default-run = "Curator"
 name = "Curator"
 path = "src/main.rs"
 
-# The Tauri shell remains the compatibility client until this native shell has
-# parity. This separate binary lets the Slint UI mature without maintaining a
-# second application state or changing release behavior prematurely.
-[[bin]]
-name = "curator-native-preview"
-path = "src/slint_main.rs"
-
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
 slint-build = "=1.18.0"
 
 [dependencies]
 curator = { path = ".." }
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-dialog = "2"
-tauri-plugin-opener = "2"
-tauri-plugin-window-state = "2"
 tokio = { version = "1", features = ["full"] }
-axum = "0.7"
-tower = { version = "0.4", features = ["util"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tracing = "0.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
 slint = "=1.18.0"
-
-[features]
-custom-protocol = ["tauri/custom-protocol"]

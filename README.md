@@ -9,9 +9,9 @@ Curator has three editions built from one Rust core and web frontend:
 
 - **Curator Server** (`curator`) is the headless backend, browser UI, download
   manager, media server, and background service.
-- **Curator Host** (`Curator`) is the full Tauri app with viewer, tray, and
-  local integrations. It owns a library just like Server.
-- **Curator Viewer** (`curator-viewer`) is a lightweight Tauri client. It
+- **Curator Host** (`Curator`) is the native Slint application with local
+  library and session controls. It owns a library just like Server.
+- **Curator Viewer** (`curator-viewer`) is a lightweight native Slint client. It
   starts no database or server and connects only to saved Tailnet hosts.
 
 Host and Server can never open the same resolved data directory at once. An OS
@@ -117,9 +117,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 node --test tests/*.test.js
 ```
 
-Run `curator --docs` for the full operational reference. Future desktop
-releases target Windows and Linux; the remaining macOS packaging files are
-retained temporarily only for deliberate removal after native stabilization.
+Run `curator --docs` for the full operational reference. Desktop releases
+target Windows and Linux.
 
 Only add sources you have the right to access, and respect each source site's
 terms and rate limits.

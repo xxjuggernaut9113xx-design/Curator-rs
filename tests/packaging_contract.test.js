@@ -6,10 +6,13 @@ const path = require('node:path');
 const root = path.join(__dirname, '..');
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 
-test('Host packaging selects the Tauri binary when the native preview is present', () => {
+test('Host and Viewer package native Slint binaries without Tauri', () => {
   const manifest = read('desktop/Cargo.toml');
   assert.match(manifest, /^default-run = "Curator"$/m);
-  assert.match(manifest, /name = "curator-native-preview"/);
+  assert.doesNotMatch(manifest, /tauri/);
+  assert.doesNotMatch(read('viewer/Cargo.toml'), /tauri/);
+  assert.match(read('desktop/build.rs'), /slint_build/);
+  assert.match(read('viewer/build.rs'), /slint_build/);
 });
 
 test('Windows Server installer has explicit user and machine scope plus opt-in P-HAR', () => {
@@ -29,59 +32,31 @@ test('Windows Server installer has explicit user and machine scope plus opt-in P
   assert.match(build, /NSIS\\makensis\.exe/);
 });
 
-test('Linux and macOS scope packages carry appropriate service definitions', () => {
+test('Linux scope packages carry appropriate service definitions', () => {
   const systemd = read('packaging/linux/curator-server.service');
   const userSystemd = read('packaging/linux/curator-server-user.service');
   const portable = read('packaging/linux/install-current-user.sh');
   const postinst = read('packaging/linux/postinst');
-  const daemon = read('packaging/macos/tech.webmaster19083.curator.server.plist');
-  const agent = read('packaging/macos/tech.webmaster19083.curator.server.user.plist');
-  const macPortable = read('packaging/macos/build-server-user-archive.sh');
-  const macDmgVerify = read('packaging/macos/verify-dmg.sh');
-  const macVerify = read('packaging/macos/verify-app.sh');
-  const macPostinstall = read('packaging/macos/postinstall-server.sh');
   assert.match(systemd, /CURATOR_INSTALL_SCOPE=all-users/);
   assert.match(systemd, /User=curator/);
   assert.match(userSystemd, /--install-scope current-user/);
   assert.match(userSystemd, /__CURATOR_SERVER_PATH__/);
   assert.match(portable, /systemctl --user enable --now/);
   assert.match(postinst, /systemctl enable --now curator-server\.service/);
-  assert.match(daemon, /<string>all-users<\/string>/);
-  assert.match(agent, /<string>current-user<\/string>/);
-  assert.match(macPortable, /install-current-user\.sh/);
-  assert.match(macDmgVerify, /hdiutil verify/);
-  assert.match(macDmgVerify, /hdiutil attach/);
-  assert.match(macVerify, /CFBundleIdentifier/);
-  assert.match(macVerify, /lipo -archs/);
-  assert.match(macVerify, /Contents\/Resources/);
-  assert.match(macPostinstall, /launchctl bootstrap system/);
 });
 
-test('release workflow validates once and attaches matrix artifacts from one job', () => {
+test('release workflow builds native Windows and Linux binaries without browser runtimes', () => {
   const workflow = read('.github/workflows/desktop-release.yml');
   assert.match(workflow, /validate:/);
-  assert.match(workflow, /windows-server:/);
-  assert.match(workflow, /build-server-installers\.ps1/);
-  assert.match(workflow, /GITHUB_PATH/);
-  assert.match(workflow, /build-server-user-archive\.sh/);
-  assert.match(workflow, /verify-app\.sh/);
-  assert.match(workflow, /verify-dmg\.sh/);
-  assert.match(workflow, /APPLE_SIGNING_IDENTITY: "-"/);
-  assert.match(workflow, /--bundles app,dmg/);
-  assert.match(workflow, /curator --docs/);
-  assert.match(workflow, /--bundles deb,appimage/);
-  assert.match(workflow, /bundle\/appimage\/\*\.AppImage/);
-  assert.match(workflow, /path: artifacts\/macos\//);
-  assert.match(workflow, /path: artifacts\/windows\//);
-  assert.match(workflow, /MACOSX_DEPLOYMENT_TARGET: "11\.0"/);
-  assert.match(workflow, /needs: \[windows-host-viewer, windows-server, linux, macos\]/);
+  assert.match(workflow, /windows:/);
+  assert.match(workflow, /linux:/);
+  assert.match(workflow, /cargo build --release --locked --bin/);
+  assert.doesNotMatch(workflow, /tauri|webkit|macos/i);
   assert.equal(fs.existsSync(path.join(root, '.github/workflows/windows-release.yml')), false);
 });
 
-test('macOS Host and Viewer bundles pin macOS 11 and use ad-hoc signing', () => {
-  for (const file of ['desktop/tauri.conf.json', 'viewer/tauri.conf.json']) {
-    const config = JSON.parse(read(file));
-    assert.equal(config.bundle.macOS.minimumSystemVersion, '11.0');
-    assert.equal(config.bundle.macOS.signingIdentity, '-');
+test('obsolete desktop WebView configuration is absent', () => {
+  for (const file of ['desktop/tauri.conf.json', 'viewer/tauri.conf.json', 'viewer/static/index.html']) {
+    assert.equal(fs.existsSync(path.join(root, file)), false);
   }
 });

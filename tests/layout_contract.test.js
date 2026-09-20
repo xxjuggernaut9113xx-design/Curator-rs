@@ -27,25 +27,23 @@ test('modal and first-run bodies remain reachable on short dynamic-height screen
 
 test('GTK mapping and remote runtime boundaries remain explicit', () => {
   const css = read('static/style.css');
-  const desktop = read('static/desktop.js');
   const oobe = read('static/oobe.html');
   const app = read('static/app.js');
   for (const name of ['adwaita', 'yaru', 'arc', 'breeze']) {
     assert.match(css, new RegExp(`\\[data-theme\\^="${name}-"\\]`));
   }
-  assert.match(desktop, /window\.__CURATOR_RUNTIME__/);
-  assert.match(desktop, /curatorRuntime === 'host'/);
+  assert.equal(fs.existsSync(path.join(root, 'static', 'desktop.js')), false);
   assert.match(oobe, /id="phar-setup-requested-input"/);
   assert.match(app, /local_integration_settings_local_only/);
   assert.match(app, /host_integration_settings_available/);
 });
 
-test('contextual commands replace library filters and native VR remains available', () => {
+test('contextual commands replace library filters in the browser fallback', () => {
   const css = read('static/style.css');
   const library = read('static/library.js');
   assert.match(library, /function setExplorerCommandContext\(context\)/);
   assert.match(library, /setExplorerCommandContext\(category\)/);
   assert.match(css, /\[data-command-context="discover"\] \.explorer-toolbar-actions/);
   assert.match(css, /\[data-command-context="settings"\] \.explorer-toolbar-filters/);
-  assert.match(library, /mode === 'vr' && curatorRuntime === 'host'/);
+  assert.match(library, /if \(mode === 'portrait' \|\| mode === 'vr'\) return wideFine/);
 });

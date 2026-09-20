@@ -1,72 +1,49 @@
 import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
 export component CuratorNativeWindow inherits Window {
-    in-out property <string> active-page: "Library";
-    in-out property <string> status: "Native shell ready";
-    callback select-page(string);
+    in-out property <string> active-workspace: "Library";
+    in-out property <string> status: "Starting Curator…";
+    callback select-workspace(string);
+    callback refresh-library();
+    callback toggle-downloads();
     callback start-session();
 
-    title: "Curator Native Preview";
-    preferred-width: 1120px;
-    preferred-height: 720px;
-    min-width: 760px;
-    min-height: 480px;
+    title: "Curator";
+    preferred-width: 1200px;
+    preferred-height: 760px;
+    min-width: 840px;
+    min-height: 560px;
 
     VerticalBox {
-        padding: 18px;
-        spacing: 14px;
-
-        Text {
-            text: "Curator";
-            font-size: 28px;
-            font-weight: 700;
-        }
-
+        padding: 20px; spacing: 14px;
+        Text { text: "Curator"; font-size: 30px; font-weight: 700; }
         HorizontalBox {
             spacing: 8px;
-            for page in ["Library", "Discover", "Organization", "Activity", "Settings", "Diagnostics"] : Button {
-                text: page;
-                primary: root.active-page == page;
-                clicked => { root.select-page(page); }
+            for workspace in ["Library", "Player", "Manage"] : Button {
+                text: workspace; primary: root.active-workspace == workspace;
+                clicked => { root.select-workspace(workspace); }
             }
         }
-
         Rectangle {
-            horizontal-stretch: 1;
-            vertical-stretch: 1;
-            border-width: 1px;
-            border-color: #5b6474;
-            border-radius: 8px;
-            background: #1d2330;
-
+            horizontal-stretch: 1; vertical-stretch: 1; border-width: 1px;
+            border-color: #5b6474; border-radius: 8px; background: #1d2330;
             VerticalBox {
-                padding: 22px;
-                spacing: 12px;
+                padding: 24px; spacing: 14px;
+                Text { text: root.active-workspace; font-size: 24px; font-weight: 600; }
                 Text {
-                    text: root.active-page;
-                    font-size: 22px;
-                    font-weight: 600;
-                }
-                Text {
-                    text: root.active-page == "Library"
-                        ? "Library browsing and image playback migrate here first."
-                        : root.active-page == "Settings"
-                        ? "Settings and recovery state are native-owned display models."
-                        : "This native command surface is ready for its shared Rust view model.";
+                    text: root.active-workspace == "Library" ? "Browse your local library, inspect metadata, and manage review state."
+                        : root.active-workspace == "Player" ? "Playback queue and session controls remain available while you move through Curator."
+                        : "Manage sources, downloads, organization, storage, settings, and diagnostics.";
                     wrap: word-wrap;
                 }
-                Button {
-                    text: "Start session";
-                    enabled: root.active-page == "Library";
-                    clicked => { root.start-session(); }
+                HorizontalBox {
+                    spacing: 10px;
+                    Button { text: "Refresh library"; clicked => { root.refresh-library(); } }
+                    Button { text: "Pause / resume downloads"; clicked => { root.toggle-downloads(); } }
+                    Button { text: "Start quick session"; clicked => { root.start-session(); } }
                 }
             }
         }
-
-        Text {
-            text: root.status;
-            color: #b9c3d6;
-            wrap: word-wrap;
-        }
+        Text { text: root.status; color: #b9c3d6; wrap: word-wrap; }
     }
 }

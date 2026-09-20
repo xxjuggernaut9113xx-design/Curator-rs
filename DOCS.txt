@@ -15,13 +15,13 @@ Curator Server (`curator`)
     mode, and background-service mode. It owns a data directory.
 
 Curator Host (`Curator`)
-    Tauri desktop application with the same backend, viewer, tray, and native
-    integrations. It owns a data directory and uses an in-process bridge.
+    Native Slint desktop application with the same backend and local
+    integrations. It owns a data directory and calls the Rust core directly.
 
 Curator Viewer (`curator-viewer`)
-    Lightweight Tauri client for saved Tailnet hosts. It starts no SQLite
-    database, no downloader, and no HTTP server. Its remote page uses ordinary
-    same-origin HTTP rather than the Host bridge.
+    Lightweight native Slint client for saved Tailnet hosts. It starts no SQLite
+    database, no downloader, and no HTTP server. It validates and pins remote
+    requests to a Tailnet peer address.
 
 Host and Server acquire an exclusive OS lock at <data-dir>/.curator-data.lock
 before SQLite opens. Do not attempt to make two backend processes share a data

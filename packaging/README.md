@@ -5,7 +5,7 @@ ownership explicit:
 
 - `curator` is **Curator Server**. It runs headlessly, serves the browser UI,
   and owns its SQLite data directory.
-- `Curator` is **Curator Host**. It embeds the same backend in a Tauri shell.
+- `Curator` is **Curator Host**. It embeds the same backend in a native Slint shell.
 - `curator-viewer` is **Curator Viewer**. It contains no database/server and
   only connects to Tailnet hosts.
 
@@ -38,6 +38,4 @@ curator import-host --from "C:\path\to\host-data" --install-scope all-users
 The command snapshots the Host database, copies library/media artifacts into
 an empty Server directory, and refuses active or non-empty data directories.
 
-Future packaging and CI target Windows and Linux. Existing macOS packaging
-assets are retained temporarily for a deliberate cleanup after the native
-Windows/Linux milestone stabilizes; they are not release targets.
+Packaging and CI target Windows and Linux.
