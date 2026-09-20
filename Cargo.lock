@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "curator"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "curator-desktop"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "curator",
  "serde_json",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "curator-viewer"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "curator",
  "dirs",
