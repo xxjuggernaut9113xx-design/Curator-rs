@@ -403,12 +403,17 @@ pub async fn initialize_with_options(options: InitializeOptions) -> Result<AppSt
         }
     };
     let action_classifier = if settings.nsfw_filter_enabled && phar_status.ready {
-        info!("P-HAR managed environment passed validation — starting optional action worker");
-        Some(nsfw::ActionClassifier::spawn(
-            python_bin.clone(),
-            action_worker_path,
-            phar::environment_dir(&data_dir),
-        ))
+        if let Some(managed_python) = phar::managed_python(&data_dir) {
+            info!("P-HAR managed environment passed validation — starting optional action worker");
+            Some(nsfw::ActionClassifier::spawn(
+                managed_python.to_string_lossy().into_owned(),
+                action_worker_path,
+                phar::environment_dir(&data_dir),
+            ))
+        } else {
+            warn!("P-HAR ready marker lost its managed interpreter; action worker will not start");
+            None
+        }
     } else {
         None
     };

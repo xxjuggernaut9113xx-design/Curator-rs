@@ -17,7 +17,7 @@ use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 
 use crate::maintenance::{self, MaintenanceKind, MaintenanceRequest};
-use crate::phar::{self, PharRuntime};
+use crate::phar::{self, PharBackend};
 use crate::AppState;
 
 fn local_only(
@@ -223,7 +223,7 @@ pub async fn phar_status(
 #[derive(Debug, Deserialize)]
 pub struct PharIntentBody {
     pub enabled: bool,
-    pub runtime: Option<PharRuntime>,
+    pub backend: Option<PharBackend>,
 }
 
 pub async fn phar_intent(
@@ -236,7 +236,7 @@ pub async fn phar_intent(
         &state.data_dir,
         state.install_scope,
         body.enabled,
-        body.runtime,
+        body.backend,
     )
     .map_err(|error| {
         (
@@ -252,14 +252,18 @@ pub async fn phar_install(
     peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    let status =
-        phar::resume_requested_setup(&state.data_dir, state.install_scope).map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error.to_string()})),
-            )
-        })?;
-    Ok(Json(json!(status)))
+    let status = phar::start_install(&state.data_dir, state.install_scope).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({
+        "accepted": true,
+        "job_id": status.job_id,
+        "message": status.message,
+        "status": status,
+    })))
 }
 
 pub async fn phar_cancel(

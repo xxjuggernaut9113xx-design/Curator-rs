@@ -41,6 +41,12 @@ def load_runtime(environment):
         raise RuntimeError("P-HAR checkpoint checksums are not verified")
     if not runtime.get("inference_probe_passed"):
         raise RuntimeError("P-HAR has not passed a real inference probe")
+    if runtime.get("backend") not in {"cuda", "rocm"}:
+        raise RuntimeError("P-HAR runtime does not declare a verified native CUDA or ROCm backend")
+    if str(runtime.get("device") or "").lower().startswith("wsl"):
+        raise RuntimeError("WSL is not a supported P-HAR execution backend")
+    if not runtime.get("managed_python"):
+        raise RuntimeError("P-HAR runtime does not declare its managed interpreter")
     upstream = environment / "upstream"
     demo = upstream / "src" / "demo" / "multimodial_demo.py"
     if not demo.is_file():

@@ -256,7 +256,7 @@ function renderFinish() {
     ['ffmpeg / ffprobe', fp.found ? 'Ready' : 'Optional — not found', fp.found ? 'ok' : 'warn'],
     ['Data directory', s.data_dir.path, s.data_dir.writable ? 'ok' : 'err'],
     ['Content classifier', ns.found ? (s.settings.nsfw_filter_enabled ? 'Ready & enabled' : 'Ready, not enabled') : 'Not available', ns.found ? 'ok' : 'warn'],
-    ['P-HAR', phar?.requested ? `${phar.phase || 'requested'} (${phar.support?.runtime || 'managed'})` : 'Not requested', phar?.ready ? 'ok' : (phar?.requested ? 'warn' : '')],
+    ['P-HAR', phar?.requested ? `${phar.phase || 'requested'} (${phar.backend || 'auto'})` : 'Not requested', phar?.ready ? 'ok' : (phar?.requested ? 'warn' : '')],
     ['Theme', s.settings.theme, ''],
     ['Concurrent downloads', String(s.settings.max_concurrent), ''],
   ];

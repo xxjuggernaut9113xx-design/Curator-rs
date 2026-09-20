@@ -38,8 +38,13 @@ pub struct Config {
     /// Curator starts, never inside an OS installer transaction.
     #[serde(default)]
     pub phar_setup_requested: bool,
-    /// `native` or `wsl2`; unsupported combinations remain visibly unready.
+    /// Native P-HAR backend preference: `auto`, `cuda`, or `rocm`.
+    /// Older `wsl`/`wsl2` values are migrated to `auto` by `phar`.
     #[serde(default)]
+    pub phar_backend: Option<String>,
+    /// Kept solely so old config files deserialize. It is cleared on the
+    /// first P-HAR status/intent evaluation and must never select WSL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phar_runtime: Option<String>,
 }
 

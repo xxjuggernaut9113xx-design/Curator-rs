@@ -95,19 +95,19 @@ qualifying upstream action class appears in two consecutive temporal windows.
 Kissing/fondling are insufficient; climax labels never assign Cum
 automatically.
 
-The managed P-HAR environment pins the upstream source and submodules beneath
-the data directory. Native Linux and Windows via WSL2 are the supported first
-tier; native Windows remains experimental until automated install and
-real inference probes pass. Curator does not redistribute or download model
-checkpoints until each checkpoint has a verified upstream right and SHA-256.
+The managed P-HAR environment pins the upstream source archive beneath the
+data directory. Native CUDA is preferred, with supported AMD ROCm used
+when CUDA is unavailable or explicitly selected. Curator does not redistribute
+or download model checkpoints until each checkpoint has a verified upstream
+right, size, and SHA-256.
 If setup is unavailable or fails, NudeNet/manual review remains operational
 and P-HAR is not reported ready.
 
 The Server NSIS installer and local OOBE both offer an unchecked opt-in choice;
 Local Admin can enable, cancel, repair, self-test, or remove the managed
-environment later. In this build the checkpoint rights/checksum gate is not
-yet satisfied, so choosing it records consent and reports a transparent
-blocked state instead of downloading an unverified model.
+environment later. Setup reports persistent native-install stages and fails
+closed if model publisher metadata or hardware compatibility cannot be
+verified; NudeNet and manual review remain available.
 
 ## Building from source
 

@@ -32,10 +32,10 @@ enum Command {
     /// Record P-HAR setup intent without downloading packages or models.
     /// Installers use this only when their opt-in checkbox was selected.
     PharIntent {
-        #[arg(long, value_parser = clap::value_parser!(bool))]
+        #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
         enabled: bool,
         #[arg(long, value_enum)]
-        runtime: Option<RuntimeArg>,
+        backend: Option<BackendArg>,
     },
 }
 
@@ -46,16 +46,18 @@ enum ScopeArg {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum RuntimeArg {
-    Native,
-    Wsl2,
+enum BackendArg {
+    Auto,
+    Cuda,
+    Rocm,
 }
 
-impl From<RuntimeArg> for curator::phar::PharRuntime {
-    fn from(value: RuntimeArg) -> Self {
+impl From<BackendArg> for curator::phar::PharBackend {
+    fn from(value: BackendArg) -> Self {
         match value {
-            RuntimeArg::Native => Self::Native,
-            RuntimeArg::Wsl2 => Self::Wsl2,
+            BackendArg::Auto => Self::Auto,
+            BackendArg::Cuda => Self::Cuda,
+            BackendArg::Rocm => Self::Rocm,
         }
     }
 }
@@ -96,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 curator::migration::configure_all_users_server(&report.destination_data_dir)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
-            Command::PharIntent { enabled, runtime } => {
+            Command::PharIntent { enabled, backend } => {
                 let scope = cli.install_scope.unwrap_or(ScopeArg::CurrentUser).into();
                 let config = curator::config::load_config_for(scope);
                 let data_dir =
@@ -105,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
                     &data_dir,
                     scope,
                     enabled,
-                    runtime.map(Into::into),
+                    backend.map(Into::into),
                 )?;
                 println!("{}", serde_json::to_string_pretty(&status)?);
             }

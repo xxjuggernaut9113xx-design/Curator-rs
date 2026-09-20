@@ -1100,17 +1100,21 @@ function renderAdminPhar(target, phar) {
   const heading = document.createElement('h3'); heading.className = 'panel-subhead'; heading.textContent = 'P-HAR'; target.append(heading);
   const detail = document.createElement('p'); detail.className = 'muted';
   const support = phar?.support || {};
-  detail.textContent = phar ? `${phar.phase.replaceAll('_', ' ')} · ${support.tier || 'unknown'} / ${support.runtime || 'unknown'} · ${phar.message}` : 'Loading P-HAR status…';
+  const accelerator = phar?.detected_gpu?.name ? ` / ${phar.detected_gpu.name}` : '';
+  const selectedBackend = `${support.backend || phar?.backend || 'unknown'}${accelerator}`;
+  detail.textContent = phar ? `${phar.phase.replaceAll('_', ' ')} · ${support.tier || 'unknown'} / ${selectedBackend} · ${phar.message}` : 'Loading P-HAR status…';
   target.append(detail);
   if (!phar) return;
   const actions = document.createElement('div'); actions.className = 'explorer-card-actions';
+  const backend = document.createElement('select'); backend.className = 'panel-button'; backend.setAttribute('aria-label', 'P-HAR native backend');
+  for (const value of ['auto', 'cuda', 'rocm']) { const option = document.createElement('option'); option.value = value; option.textContent = value === 'auto' ? 'Auto (CUDA first)' : value.toUpperCase(); option.selected = (phar.backend || 'auto') === value; backend.append(option); }
   const refresh = () => { const panel = target.closest('.settings-local-admin'); if (panel) refreshAdminPanel(panel); };
   const intent = panelButton(phar.requested ? 'Disable P-HAR' : 'Enable P-HAR setup');
   intent.addEventListener('click', async () => {
-    try { await api('/api/admin/phar', { method: 'POST', body: JSON.stringify({ enabled: !phar.requested }) }); refresh(); }
+    try { await api('/api/admin/phar', { method: 'POST', body: JSON.stringify({ enabled: !phar.requested, backend: backend.value }) }); refresh(); }
     catch (error) { toast(`Could not update P-HAR: ${error.message}`, true); }
   });
-  const install = panelButton('Evaluate setup'); install.disabled = !phar.requested;
+  const install = panelButton('Install / resume'); install.disabled = !phar.requested;
   install.addEventListener('click', async () => {
     try { const result = await api('/api/admin/phar/install', { method: 'POST' }); toast(result.message || 'P-HAR setup evaluated.'); refresh(); }
     catch (error) { toast(`Could not evaluate P-HAR: ${error.message}`, true); }
@@ -1130,7 +1134,7 @@ function renderAdminPhar(target, phar) {
     try { const result = await api('/api/admin/phar/self-test', { method: 'POST' }); toast(result.message || 'P-HAR self-test finished.'); refresh(); }
     catch (error) { toast(`P-HAR self-test failed: ${error.message}`, true); }
   });
-  actions.append(intent, install, cancel, repair, selfTest); target.append(actions);
+  actions.append(backend, intent, install, cancel, repair, selfTest); target.append(actions);
 }
 
 async function refreshAdminPanel(panel) {

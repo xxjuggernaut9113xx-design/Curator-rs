@@ -223,9 +223,8 @@ P-HAR
 -----
 
 P-HAR is off by default and managed separately from NudeNet. Curator pins the
-upstream P-HAR source revision, its MMAction2/MMDetection/MMPose submodules,
-SHA-256 pins for the upstream dependency declaration and class label manifest,
-and a status marker under <data-dir>/phar.
+upstream P-HAR source revision and records artifact metadata plus a status
+marker under <data-dir>/phar.
 
 The adapter invokes the upstream multimodal demo rather than treating an
 arbitrary file as a TorchScript model. Its exact 17-class mapping permits Fast
@@ -233,18 +232,18 @@ evidence only for sexual-action/position classes after two consecutive windows
 at the required threshold. `kissing` and `fondling` never qualify; `cumshot`
 and `facial-cumshot` remain evidence only and never cause automatic Cum.
 
-Native Linux and Windows through WSL2 are the supported first tier. Native
-Windows is experimental and cannot be called ready until
-automated environment setup and a real inference probe pass. Local Admin can
-record intent, evaluate/resume, cancel, repair, inspect, self-test, and remove
-the managed environment.
+P-HAR runs in a managed native CUDA or supported AMD ROCm environment. Auto
+selection prefers CUDA and then ROCm; Local Admin can record an explicit
+backend override, install/resume, cancel, repair, inspect, self-test, and
+remove the managed environment. A backend is never ready until environment
+setup and a real inference probe pass.
 
 Checkpoint redistribution rights are deliberately not assumed. Until each
 required checkpoint has a verified upstream source, rights status, and SHA-256,
-Curator downloads nothing and reports P-HAR blocked/unready. The NSIS and OOBE
-opt-ins therefore record consent only in this build; Local Admin can show the
-blocked reason, cancel, repair, self-test, or remove the managed environment.
-Failed or blocked P-HAR never disables NudeNet/manual review.
+Curator downloads nothing and reports P-HAR failed/unready. The NSIS and OOBE
+opt-ins record consent only; Local Admin can show the actionable failure,
+cancel, repair, self-test, or remove the managed environment.
+Failed P-HAR never disables NudeNet/manual review.
 
 
 PACKAGING AND RELEASES
