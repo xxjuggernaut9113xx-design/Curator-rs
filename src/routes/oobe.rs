@@ -47,6 +47,9 @@ pub async fn serve_root(
     State(state): State<Arc<AppState>>,
     peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Response {
+    if state.edition != crate::edition::Edition::Server {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let completed = state.settings.read().await.oobe_completed;
     if !completed && ensure_local(&peer).is_err() {
         return (

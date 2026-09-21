@@ -1,49 +1,184 @@
-import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
+export struct MediaRow { title: string, detail: string, selected: bool }
 export component CuratorNativeWindow inherits Window {
-    in-out property <string> active-workspace: "Library";
-    in-out property <string> status: "Starting Curator…";
-    callback select-workspace(string);
-    callback refresh-library();
-    callback toggle-downloads();
-    callback start-session();
-
     title: "Curator";
-    preferred-width: 1200px;
-    preferred-height: 760px;
-    min-width: 840px;
-    min-height: 560px;
+    preferred-width: 1200px; preferred-height: 800px;
+    min-width: 800px; min-height: 560px;
+    in-out property <int> workspace: 0;
+    in-out property <[MediaRow]> media;
+    in-out property <[string]> queue;
+    in-out property <[string]> navigation;
+    in-out property <[string]> groups;
+    in-out property <string> status;
+    in-out property <string> inspector;
+    in-out property <string> download-status;
+    in-out property <image> preview;
+    in-out property <string> playing;
+    in-out property <string> session-status;
+    callback session-control(string);
+    callback fullscreen();
+    in-out property <bool> busy;
+    in-out property <bool> has-more;
+    in-out property <bool> has-previous;
+    in-out property <bool> local-host;
+    callback browse(string, string, string, string, string, bool);
+    callback previous-page();
+    callback import-folder();
+    callback navigate(int);
+    callback create-group(string);
+    callback move-to-group(int);
+    callback select-item(int, bool);
+    callback rate(int);
+    callback tag(string);
+    callback approve();
+    callback enqueue(bool);
+    callback play(int);
+    callback remove-queued(int);
+    callback add-sources(string);
+    callback downloads(bool);
+    callback resync-all();
+    callback refresh-manage();
+    callback refresh-diagnostic-log();
+    callback discover(string, string);
+    callback queue-discovery();
+    callback save-theme(string);
+    callback delete-selected();
+    callback refresh-selected();
+    callback clip-selected(int);
+    in-out property <string> recovery-status;
+    callback recovery(string, string, string);
+    in-out property <string> manage-status;
+    in-out property <string> diagnostic-log;
+    in-out property <string> discovery-status;
 
     VerticalBox {
-        padding: 20px; spacing: 14px;
-        Text { text: "Curator"; font-size: 30px; font-weight: 700; }
+        padding: 16px; spacing: 12px;
         HorizontalBox {
-            spacing: 8px;
-            for workspace in ["Library", "Player", "Manage"] : Button {
-                text: workspace; primary: root.active-workspace == workspace;
-                clicked => { root.select-workspace(workspace); }
+            Text { text: "Curator"; font-size: 28px; font-weight: 700; }
+            for label[index] in ["Library", "Player", "Manage"]: Button {
+                text: label; primary: root.workspace == index;
+                clicked => { root.workspace = index; }
             }
         }
-        Rectangle {
-            horizontal-stretch: 1; vertical-stretch: 1; border-width: 1px;
-            border-color: #5b6474; border-radius: 8px; background: #1d2330;
+        if root.workspace == 0: VerticalBox {
+            HorizontalBox {
+                types := ComboBox { model: ["All media", "image", "clip", "video"]; }
+                sorts := ComboBox { model: ["date_desc", "date_asc", "filename_asc", "filename_desc", "rating_desc", "size_desc"]; }
+                reviews := ComboBox { model: ["all", "unrated", "auto", "needs_review", "reviewed"]; }
+            }
+            HorizontalBox {
+                search := LineEdit { placeholder-text: "Search filename, source, or creator"; }
+                filter-tag := LineEdit { placeholder-text: "Filter by tag"; }
+                Button { text: "Search / refresh"; enabled: !root.busy; clicked => { root.browse(types.current-value, sorts.current-value, search.text, reviews.current-value, filter-tag.text, false); } }
+                Button { text: "Previous page"; enabled: !root.busy && root.has-previous; clicked => { root.previous-page(); } }
+                Button { text: "Next page"; enabled: !root.busy && root.has-more; clicked => { root.browse(types.current-value, sorts.current-value, search.text, reviews.current-value, filter-tag.text, true); } }
+            }
+            HorizontalBox {
+                ScrollView { horizontal-stretch: 1; VerticalBox {
+                    Button { text: "All sources and groups"; clicked => { root.navigate(-1); } }
+                    for name[index] in root.navigation: Button { text: name; clicked => { root.navigate(index); } }
+                } }
+                ScrollView {
+                    vertical-stretch: 1; horizontal-stretch: 2;
+                    VerticalBox {
+                        for row[index] in root.media: HorizontalBox {
+                            CheckBox { checked: row.selected; toggled => { root.select-item(index, self.checked); } }
+                            Button { text: row.title; clicked => { root.select-item(index, !row.selected); } }
+                            Text { text: row.detail; overflow: elide; }
+                        }
+                    }
+                }
+                VerticalBox {
+                    horizontal-stretch: 1;
+                    Text { text: "Selection"; font-size: 20px; }
+                    Text { text: root.inspector; wrap: word-wrap; }
+                    HorizontalBox {
+                        for stars in [1, 2, 3, 4, 5]: Button { text: stars + " ★"; enabled: !root.busy; clicked => { root.rate(stars); } }
+                    }
+                    tags := LineEdit { placeholder-text: "Tag for selected items"; }
+                    Button { text: "Add tag"; enabled: !root.busy; clicked => { root.tag(tags.text); } }
+                    Button { text: "Approve suggestions"; enabled: !root.busy; clicked => { root.approve(); } }
+                    Button { text: "Refresh metadata"; enabled: !root.busy; clicked => { root.refresh-selected(); } }
+                    Button { text: "Delete selected media"; enabled: !root.busy; clicked => { root.delete-selected(); } }
+                    Button { text: "Split selected video into 60-second clips"; enabled: !root.busy; clicked => { root.clip-selected(60); } }
+                    target-group := ComboBox { model: root.groups; }
+                    Button { text: "Move selection to group"; enabled: !root.busy; clicked => { root.move-to-group(target-group.current-index); } }
+                    Button { text: "Play selection"; clicked => { root.enqueue(true); root.workspace = 1; } }
+                    Button { text: "Append to queue"; clicked => { root.enqueue(false); } }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+        }
+        if root.workspace == 1: HorizontalBox {
             VerticalBox {
-                padding: 24px; spacing: 14px;
-                Text { text: root.active-workspace; font-size: 24px; font-weight: 600; }
-                Text {
-                    text: root.active-workspace == "Library" ? "Browse your local library, inspect metadata, and manage review state."
-                        : root.active-workspace == "Player" ? "Playback queue and session controls remain available while you move through Curator."
-                        : "Manage sources, downloads, organization, storage, settings, and diagnostics.";
-                    wrap: word-wrap;
-                }
+                horizontal-stretch: 3;
+                Text { text: root.playing; wrap: word-wrap; }
+                Button { text: "Fullscreen / windowed"; clicked => { root.fullscreen(); } }
+                Image { source: root.preview; image-fit: contain; vertical-stretch: 1; }
+                Text { text: root.session-status; wrap: word-wrap; }
                 HorizontalBox {
-                    spacing: 10px;
-                    Button { text: "Refresh library"; clicked => { root.refresh-library(); } }
-                    Button { text: "Pause / resume downloads"; clicked => { root.toggle-downloads(); } }
-                    Button { text: "Start quick session"; clicked => { root.start-session(); } }
+                    for command in ["Start", "Pause", "Resume", "End"]: Button { text: command + " session"; clicked => { root.session-control(command); } }
+                }
+            }
+            ScrollView {
+                horizontal-stretch: 1;
+                VerticalBox {
+                    Text { text: "Player queue"; font-size: 20px; }
+                    for title[index] in root.queue: HorizontalBox {
+                        Button { text: title; clicked => { root.play(index); } }
+                        Button { text: "Remove"; clicked => { root.remove-queued(index); } }
+                    }
                 }
             }
         }
-        Text { text: root.status; color: #b9c3d6; wrap: word-wrap; }
+        if root.workspace == 2: VerticalBox {
+            Text { text: "Sources and downloads"; font-size: 22px; }
+            source := LineEdit { placeholder-text: "Source URL"; }
+            Button { text: "Add source"; enabled: !root.busy; clicked => { root.add-sources(source.text); } }
+            if root.local-host: Button { text: "Import local folder…"; enabled: !root.busy; clicked => { root.import-folder(); } }
+            HorizontalBox {
+                group-name := LineEdit { placeholder-text: "New group name"; }
+                Button { text: "Create group"; enabled: !root.busy; clicked => { root.create-group(group-name.text); } }
+            }
+            HorizontalBox {
+                Button { text: "Pause downloads"; enabled: !root.busy; clicked => { root.downloads(true); } }
+                Button { text: "Resume downloads"; enabled: !root.busy; clicked => { root.downloads(false); } }
+                Button { text: "Resync all sources"; enabled: !root.busy; clicked => { root.resync-all(); } }
+            }
+            ScrollView { Text { text: root.download-status; wrap: word-wrap; } }
+            Text { text: "Discovery"; font-size: 22px; }
+            HorizontalBox {
+                discovery-provider := ComboBox { model: ["All providers", "local", "balbums"]; }
+                discovery-query := LineEdit { placeholder-text: "Find collections, creators, or a page URL"; }
+                Button { text: "Search"; enabled: !root.busy; clicked => { root.discover(discovery-query.text, discovery-provider.current-value); } }
+                Button { text: "Queue compatible results"; enabled: !root.busy; clicked => { root.queue-discovery(); } }
+            }
+            ScrollView { min-height: 100px; Text { text: root.discovery-status; wrap: word-wrap; } }
+            Text { text: "Settings and diagnostics"; font-size: 22px; }
+            HorizontalBox {
+                theme := ComboBox { model: ["system", "atelier-dark", "midnight", "ember", "linen", "sage", "aurora", "oled"]; }
+                Button { text: "Save native theme"; enabled: !root.busy; clicked => { root.save-theme(theme.current-value); } }
+                Button { text: "Refresh diagnostics"; clicked => { root.refresh-manage(); } }
+                Button { text: "View diagnostic log"; clicked => { root.refresh-diagnostic-log(); } }
+            }
+            ScrollView { min-height: 100px; Text { text: root.manage-status; wrap: word-wrap; } }
+            ScrollView { min-height: 100px; Text { text: root.diagnostic-log; wrap: word-wrap; } }
+            if root.local-host: VerticalBox {
+                Text { text: "Backups and recovery"; font-size: 22px; }
+                HorizontalBox {
+                    Button { text: "Create backup"; clicked => { root.recovery("Create backup", "", ""); } }
+                    Button { text: "Refresh backup and job status"; clicked => { root.recovery("Refresh", "", ""); } }
+                }
+                backup-id := LineEdit { placeholder-text: "Backup ID from the list below"; }
+                confirmation := LineEdit { placeholder-text: "To restore, type RESTORE BACKUP (requires restart)"; }
+                HorizontalBox {
+                    Button { text: "Validate backup"; clicked => { root.recovery("Validate backup", backup-id.text, ""); } }
+                    Button { text: "Restore backup"; enabled: confirmation.text == "RESTORE BACKUP" && backup-id.text != ""; clicked => { root.recovery("Restore backup", backup-id.text, confirmation.text); } }
+                }
+                ScrollView { min-height: 100px; Text { text: root.recovery-status; wrap: word-wrap; } }
+            }
+        }
+        Text { text: root.status; wrap: word-wrap; }
     }
 }

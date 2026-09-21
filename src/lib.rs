@@ -14,6 +14,7 @@ pub mod local_import;
 pub mod maintenance;
 mod media_files;
 pub mod migration;
+pub mod native;
 mod nsfw;
 mod oobe;
 pub mod phar;
@@ -592,7 +593,7 @@ pub async fn initialize_with_options(options: InitializeOptions) -> Result<AppSt
 }
 
 pub fn router(state: AppState) -> axum::Router {
-    routes::build_router(Arc::new(state.clone()))
+    let router = routes::build_router(Arc::new(state.clone()))
         .layer(CompressionLayer::new())
         .nest(
             "/library",
@@ -602,8 +603,14 @@ pub fn router(state: AppState) -> axum::Router {
                     Arc::new(state.clone()),
                     routes::library::reconcile_not_found,
                 )),
+        );
+    if state.edition == edition::Edition::Server {
+        router.fallback_service(
+            ServeDir::new(&state.static_dir).append_index_html_on_directories(true),
         )
-        .fallback_service(ServeDir::new(&state.static_dir).append_index_html_on_directories(true))
+    } else {
+        router
+    }
 }
 
 pub async fn shutdown(state: &AppState) {

@@ -58,14 +58,30 @@ struct TailnetPeer {
 fn preferences_path() -> Result<PathBuf, String> {
     let directory = dirs::config_dir()
         .ok_or("No user configuration directory is available.")?
-        .join("Curator Viewer");
+        .join("tech.webmaster19083.curator.viewer");
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     Ok(directory.join("hosts.json"))
 }
+fn legacy_preferences_path() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or("No user configuration directory is available.")?
+        .join("Curator Viewer")
+        .join("hosts.json"))
+}
 fn load_hosts() -> Result<HostStore, String> {
-    match std::fs::read_to_string(preferences_path()?) {
+    let primary = preferences_path()?;
+    match std::fs::read_to_string(&primary) {
         Ok(text) => serde_json::from_str(&text).map_err(|error| error.to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HostStore::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let legacy = legacy_preferences_path()?;
+            match std::fs::read_to_string(legacy) {
+                Ok(text) => serde_json::from_str(&text).map_err(|error| error.to_string()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(HostStore::default())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        }
         Err(error) => Err(error.to_string()),
     }
 }
@@ -80,8 +96,17 @@ fn save_host(host: SavedHost) -> Result<(), String> {
     } else {
         store.hosts.push(host);
     }
-    let text = serde_json::to_string_pretty(&store).map_err(|error| error.to_string())?;
-    std::fs::write(preferences_path()?, text).map_err(|error| error.to_string())
+    use std::io::Write;
+    let path = preferences_path()?;
+    let parent = path.parent().ok_or("Invalid Viewer preferences path")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(&mut file, &store).map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())?;
+    file.as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    file.persist(path).map_err(|error| error.to_string())?;
+    Ok(())
 }
 fn normalized_endpoint(raw: &str) -> Result<reqwest::Url, String> {
     let mut url = reqwest::Url::parse(raw.trim())
@@ -199,75 +224,121 @@ async fn connect(endpoint: &str) -> Result<(String, String), String> {
         .no_proxy()
         .build()
         .map_err(|error| error.to_string())?;
-    let pinned = origin(
-        addresses[0],
-        url.port_or_known_default().unwrap_or(DEFAULT_PORT),
-    );
-    let info: SystemInfo = client
-        .get(format!("{pinned}/api/system/info"))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json()
-        .await
-        .map_err(|_| "The peer did not return a Curator system-info response.")?;
-    if info.api_protocol != curator::API_PROTOCOL
-        || !matches!(info.edition.as_str(), "host" | "server")
-        || !info.tailnet_only
-    {
-        return Err("The peer is not a compatible Tailnet-only Curator Host or Server.".into());
+    let port = url.port_or_known_default().unwrap_or(DEFAULT_PORT);
+    let mut failures = Vec::new();
+    for address in addresses {
+        let pinned = origin(address, port);
+        let info = match client
+            .get(format!("{pinned}/api/system/info"))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => match response.json::<SystemInfo>().await {
+                Ok(info) => info,
+                Err(_) => {
+                    failures.push(format!("{address}: invalid system information"));
+                    continue;
+                }
+            },
+            Err(error) => {
+                failures.push(format!("{address}: {error}"));
+                continue;
+            }
+        };
+        if info.api_protocol == curator::API_PROTOCOL
+            && matches!(info.edition.as_str(), "host" | "server")
+            && info.tailnet_only
+        {
+            return Ok((info.instance_id, pinned));
+        }
+        failures.push(format!("{address}: incompatible Curator host"));
     }
-    let summary: serde_json::Value = match client
-        .get(format!("{pinned}/api/library/summary"))
-        .send()
-        .await
-    {
-        Ok(response) => response.json().await.unwrap_or_default(),
-        Err(_) => serde_json::Value::Null,
-    };
-    let message = if summary.is_null() {
-        format!("Connected to {}.", info.edition)
-    } else {
-        format!("Connected to {}: {}", info.edition, summary)
-    };
-    Ok((info.instance_id, message))
+    Err(format!(
+        "Could not connect to a compatible Tailnet Curator host ({})",
+        failures.join("; ")
+    ))
 }
 
-fn main() -> Result<(), slint::PlatformError> {
-    let runtime = tokio::runtime::Runtime::new().expect("Could not start Viewer runtime");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use slint::ComponentHandle;
+    use std::{cell::RefCell, rc::Rc, sync::mpsc};
+    let runtime = tokio::runtime::Runtime::new()?;
     let window = CuratorViewerWindow::new()?;
+    let selected = Rc::new(RefCell::new(None));
+    let (tx, rx) = mpsc::channel();
+    let handle = runtime.handle().clone();
     let weak = window.as_weak();
     window.on_connect(move |name, endpoint| {
-        let result = runtime.block_on(connect(&endpoint));
-        if let Some(window) = weak.upgrade() {
-            match result {
-                Ok((instance_id, message)) => {
-                    let _ = save_host(SavedHost {
-                        name: name.to_string(),
-                        endpoint: endpoint.to_string(),
+        if let Some(w) = weak.upgrade() {
+            w.set_status("Validating Tailnet host…".into());
+            w.set_busy(true);
+        }
+        let tx = tx.clone();
+        handle.spawn(async move {
+            let result = connect(&endpoint).await;
+            let _ = tx.send((name.to_string(), endpoint.to_string(), result));
+        });
+    });
+    let timer = slint::Timer::default();
+    let weak = window.as_weak();
+    let target = selected.clone();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(50),
+        move || {
+            let Some(w) = weak.upgrade() else {
+                return;
+            };
+            while let Ok((name, endpoint, result)) = rx.try_recv() {
+                w.set_busy(false);
+                let outcome = (|| -> Result<(), String> {
+                    let (instance_id, pinned) = result?;
+                    let store = load_hosts()?;
+                    if store
+                        .hosts
+                        .iter()
+                        .any(|host| host.endpoint == endpoint && host.instance_id != instance_id)
+                    {
+                        return Err("This saved address now identifies a different library.".into());
+                    }
+                    let client = curator::native::RemoteClient::from_validated_peer(&pinned)?;
+                    if name.trim().is_empty() {
+                        return Err("Give the host a name.".into());
+                    }
+                    save_host(SavedHost {
+                        name,
+                        endpoint,
                         instance_id,
-                    });
-                    window.set_status(message.into());
+                    })?;
+                    *target.borrow_mut() = Some(client);
+                    w.hide().map_err(|e| e.to_string())?;
+                    slint::quit_event_loop().map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
+                if let Err(error) = outcome {
+                    w.set_status(error.into());
                 }
-                Err(error) => window.set_status(error.into()),
+            }
+        },
+    );
+    match load_hosts() {
+        Ok(store) => {
+            if let Some(host) = store.hosts.first() {
+                window.set_host_name(host.name.clone().into());
+                window.set_endpoint(host.endpoint.clone().into());
             }
         }
-    });
-    let stored = load_hosts().unwrap_or_default();
-    if let Some(host) = stored.hosts.first() {
-        window.set_host_name(host.name.clone().into());
-        window.set_endpoint(host.endpoint.clone().into());
+        Err(error) => window.set_status(error.into()),
     }
-    window.set_status(
-        format!(
-            "{} saved host(s). Viewer stores no library database.",
-            stored.hosts.len()
-        )
-        .into(),
-    );
-    window.run()
+    window.run()?;
+    timer.stop();
+    drop(timer);
+    drop(window);
+    if let Some(client) = selected.borrow_mut().take() {
+        curator_desktop::run_ui(&runtime, curator::native::Client::Remote(client))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

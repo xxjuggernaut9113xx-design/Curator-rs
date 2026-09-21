@@ -50,6 +50,7 @@ fn sort_order(sort: &str) -> &'static str {
 
 #[derive(Deserialize, Default)]
 pub struct MediaQuery {
+    search: Option<String>,
     limit: Option<usize>,
     after_id: Option<i64>,
     cursor: Option<String>,
@@ -153,6 +154,13 @@ pub async fn list(
     let mut extra = String::from(
         " AND (m.missing=0 OR COALESCE(m.retention_deleted,0)=1 OR m.skip_reason IS NOT NULL)",
     );
+    if let Some(search) = q.search.as_deref().filter(|s| !s.trim().is_empty()) {
+        // Literal substring matching avoids interpreting user-entered SQL
+        // wildcard characters. Apply before keyset pagination.
+        params.push(search.trim().to_lowercase().into());
+        let n = params.len();
+        extra.push_str(&format!(" AND (instr(lower(m.filename),?{n})>0 OR instr(lower(s.name),?{n})>0 OR EXISTS(SELECT 1 FROM source_metadata sm WHERE sm.media_id=m.id AND instr(lower(sm.creator),?{n})>0))"));
+    }
     let rating_status_clause = match q.rating_status.as_deref().unwrap_or("") {
         "" | "all" => String::new(),
         "unrated" => format!(" AND m.human_rating IS NULL AND NOT ({HUMAN_PACE_TAG_SQL}) AND m.auto_rating=0 AND m.action_rating=0"),
