@@ -9,7 +9,7 @@
 
 ## Architecture gates
 
-- [ ] **A-01 Typed service boundary** — Extract `library`, `settings`, `discovery`, `storage`, `downloads`, `jobs`, `backup`, `export`, `media`, and `playback` services; adapters retain every path, method and format. H/S full; V scoped. Status: partial. Session admission and media byte-range planning now have transport-independent services with direct/HTTP tests; the broader extraction and Viewer role negotiation remain open.
+- [ ] **A-01 Typed service boundary** — Extract `library`, `settings`, `discovery`, `storage`, `downloads`, `jobs`, `backup`, `export`, `media`, and `playback` services; adapters retain every path, method and format. H/S full; V scoped. Status: partial. Session admission, media byte-range planning, and typed download activity now have transport-independent services with direct/HTTP tests; download controls, the broader extraction, and Viewer role negotiation remain open.
 - [ ] **A-02 Operation control** — Separate interaction, jobs, thumbnails and playback; use bounded queues, cancellation, deduplication, progress and actionable errors. Status: partial. Native Host/Viewer now use bounded regular (128), control (16), and image (1) work queues; a full regular queue reports rejected actions and a stale preview result cannot replace the current preview. The control-lane unit test covers pause admission under a full regular queue. Seek, cancellation, navigation latency, quit latency, Windows manual, and Linux manual results remain unavailable.
 - [ ] **A-03 Typed durable models** — Versioned settings, discovery capability, storage, activity, job, backup, export, media and playback models. Preserve unknown Viewer preferences. Status: partial (`db::Settings` coexists with ad-hoc JSON).
 - [ ] **A-04 Lifecycle authority** — Service boundary owns permissions, maintenance lease, library lock and shutdown; listener failure remains visible while offline H works. Status: partial. Session start/control now share direct-service admission for maintenance and shutdown; direct and HTTP parity, shutdown denial, and direct maintenance denial have automated tests. Other operations, role permissions, occupied port, disconnect, and Windows/Linux manual results remain open.
@@ -43,7 +43,7 @@
 
 - [ ] **M-01 Discover** — provider capability/status/auth, query/result-type/sort/page/cancel/errors, selection/select-all/add/download. H/V permitted remote subset. Status: partial.
 - [ ] **M-02 Organization/sources** — nested group CRUD, source edit/inspect/resync/pause/resume/remove/log and clear remove-vs-files distinction. H full; V restricted. Status: partial.
-- [ ] **M-03 Activity** — active/queued/retrying totals, global/per-source control, current file/retry/errors and hidden/tray updates. Status: partial.
+- [ ] **M-03 Activity** — active/queued/retrying totals, global/per-source control, current file/retry/errors and hidden/tray updates. Status: partial. Native Host now reads a typed `services::downloads::status` snapshot directly; `/api/downloads/status` serializes the same model, with direct/native/HTTP parity tested using a disposable library. Native per-source controls, retry/error presentation, hidden/tray updates, and Windows/Linux manual results remain open.
 - [ ] **M-04 Import/export** — source-list, metadata and package workflows with native dialogs, validation/conflicts/progress/cancel. H full; V explicit remote exports only. Status: backend only.
 
 ## Settings, admin and lifecycle

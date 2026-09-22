@@ -491,7 +491,7 @@ impl Client {
 
     pub async fn downloads(&self) -> Result<Value, String> {
         match self {
-            Self::Local(client) => Ok(client.downloads().await),
+            Self::Local(client) => client.downloads().await,
             Self::Remote(client) => client.request("/api/downloads/status", None).await,
         }
     }
@@ -630,8 +630,9 @@ impl LocalClient {
         crate::media_path(&self.state, id).map_err(|e| e.to_string())
     }
 
-    pub async fn downloads(&self) -> Value {
-        routes::downloads::status(State(self.state.clone())).await.0
+    pub async fn downloads(&self) -> Result<Value, String> {
+        serde_json::to_value(crate::services::downloads::status(&self.state).await)
+            .map_err(|error| error.to_string())
     }
 
     pub async fn execute(&self, command: Command) -> Result<Value, String> {

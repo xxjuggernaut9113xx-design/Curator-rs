@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -12,91 +11,13 @@ use crate::AppState;
 
 // ─── GET /api/downloads/status ───────────────────────────────────────────────
 
-pub async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let paused = state.downloads_paused.load(Ordering::SeqCst);
-    let active_ids: HashSet<i64> = state
-        .active_processes
-        .lock()
-        .await
-        .keys()
-        .copied()
-        .collect();
-    let active = active_ids.len();
-    let paused_ids: Vec<i64> = state
-        .paused_source_ids
-        .lock()
-        .await
-        .iter()
-        .cloned()
-        .collect();
-    let mut sources = state.pool.get().ok().and_then(|conn| {
-        let mut statement = conn.prepare(
-            "SELECT s.id,s.name,s.status,s.item_count,s.known_total,
-                    (SELECT COUNT(*) FROM media m WHERE m.source_id=s.id AND m.downloaded=1 AND m.missing=0) AS indexed_count,
-                    s.completed_count,s.current_filename,s.retry_at,s.error_message,s.queued_at,s.started_at,s.completed_at,s.progress_updated_at
-             FROM sources s ORDER BY COALESCE(s.queued_at,s.added_at),s.id",
-        ).ok()?;
-        let mapped = statement.query_map([], |row| Ok((
-            row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, i64>(8)?,
-            row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?,
-            row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?,
-        ))).ok()?;
-        let rows = mapped.collect::<rusqlite::Result<Vec<_>>>().ok()?;
-        Some(rows)
-    }).unwrap_or_default();
-    let mut queue_position = 0_i64;
-    let source_rows = sources.drain(..).map(|row| {
-        let (id,name,status,item_count,known_total,indexed_count,persisted_completed,current_filename,retry_at,error,queued_at,started_at,completed_at,updated_at) = row;
-        let phase = match status.as_str() {
-            "pending" => "queued",
-            "downloading" if active_ids.contains(&id) => "active",
-            "downloading" => "queued",
-            "indexing" => "indexing",
-            "retrying" => "retrying",
-            "paused" => "paused",
-            "storage_limit" => "storage_limit",
-            "low_disk" => "low_disk",
-            "done" => "completed",
-            "error" => "failed",
-            _ => "queued",
-        };
-        let position = if phase == "queued" { queue_position += 1; Some(queue_position) } else { None };
-        let completed = indexed_count.max(persisted_completed).max(item_count.min(indexed_count));
-        let percentage = known_total.map(|total| {
-            if total == 0 { if phase == "completed" { 100.0 } else { 0.0 } }
-            else { ((completed as f64 / total as f64) * 100.0).clamp(0.0, 100.0) }
-        });
-        json!({
-            "id":id,"name":name,"status":status,"phase":phase,"queue_position":position,
-            "known_total":known_total,"completed_count":completed,"percentage":percentage,
-            "indeterminate":known_total.is_none(),"current_filename":current_filename,
-            "retry_at":if retry_at>0 { Some(retry_at) } else { None },"error":error,
-            "queued_at":queued_at,"started_at":started_at,"completed_at":completed_at,"updated_at":updated_at,
-        })
-    }).collect::<Vec<_>>();
-    let queued_count = source_rows
-        .iter()
-        .filter(|row| row["phase"] == "queued")
-        .count() as i64;
-    let retrying_count = source_rows
-        .iter()
-        .filter(|row| row["phase"] == "retrying")
-        .count() as i64;
-
-    Json(json!({
-        "paused":       paused,
-        "active_count": active,
-        "queued_count": queued_count,
-        "retrying_count": retrying_count,
-        "paused_source_ids": paused_ids,
-        "sources": source_rows,
-    }))
+pub async fn status(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::services::downloads::DownloadStatus> {
+    Json(crate::services::downloads::status(&state).await)
 }
 
-// ─── POST /api/downloads/pause ───────────────────────────────────────────────
-
+// POST /api/downloads/pause
 pub async fn pause(State(state): State<Arc<AppState>>) -> Json<Value> {
     let _control = state.download_control.lock().await;
     state.downloads_paused.store(true, Ordering::SeqCst);
