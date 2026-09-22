@@ -1,6 +1,6 @@
 # Curator packaging contracts
 
-Each product consumes the workspace version (`0.3.0`) and keeps its library
+Each product consumes the workspace version (`0.3.3`) and keeps its library
 ownership explicit:
 
 - `curator` is **Curator Server**. It runs headlessly, serves the browser UI,

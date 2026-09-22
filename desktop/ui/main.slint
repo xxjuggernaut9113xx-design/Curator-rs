@@ -2,7 +2,7 @@ import { Button, CheckBox, ComboBox, LineEdit, ScrollView, HorizontalBox, Vertic
 
 export struct MediaRow { title: string, detail: string, selected: bool }
 export component CuratorNativeWindow inherits Window {
-    title: "Curator";
+    title: root.local-host ? "Curator Host" : "Curator Viewer";
     preferred-width: 1200px; preferred-height: 800px;
     min-width: 800px; min-height: 560px;
     in-out property <int> workspace: 0;
@@ -62,7 +62,7 @@ export component CuratorNativeWindow inherits Window {
     VerticalBox {
         padding: 16px; spacing: 12px;
         HorizontalBox {
-            Text { text: "Curator"; font-size: 28px; font-weight: 700; }
+            Text { text: root.local-host ? "Curator Host" : "Curator Viewer"; font-size: 28px; font-weight: 700; }
             Button { text: "File"; clicked => { root.workspace = 0; } }
             Button { text: "Tools"; clicked => { root.workspace = 2; } }
             for label[index] in ["Library", "Player", "Manage"]: Button {

@@ -48,23 +48,26 @@ jobs:
       matrix:
         include:
           - package: curator
+            edition: server
             binary: curator
             artifact: curator.exe
           - package: curator-desktop
+            edition: host
             binary: Curator
             artifact: Curator.exe
           - package: curator-viewer
+            edition: viewer
             binary: curator-viewer
             artifact: curator-viewer.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build ${{ matrix.binary }} with verbose diagnostics
+      - name: Build Curator ${{ matrix.edition }} with verbose diagnostics
         run: cargo build -vv --release --locked -p ${{ matrix.package }} --bin ${{ matrix.binary }}
       - uses: actions/upload-artifact@v4
         with:
-          name: curator-windows-${{ matrix.binary }}
+          name: curator-${{ matrix.edition }}-windows
           path: target/release/${{ matrix.artifact }}
 
   linux:
@@ -80,11 +83,16 @@ jobs:
         run: cargo build -vv --release --locked --workspace
       - uses: actions/upload-artifact@v4
         with:
-          name: curator-linux-native
-          path: |
-            target/release/curator
-            target/release/Curator
-            target/release/curator-viewer
+          name: curator-server-linux
+          path: target/release/curator
+      - uses: actions/upload-artifact@v4
+        with:
+          name: curator-host-linux
+          path: target/release/Curator
+      - uses: actions/upload-artifact@v4
+        with:
+          name: curator-viewer-linux
+          path: target/release/curator-viewer
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

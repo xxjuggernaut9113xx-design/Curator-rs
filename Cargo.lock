@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "curator"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "curator-desktop"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "curator",
  "rfd",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "curator-viewer"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "curator",
  "curator-desktop",

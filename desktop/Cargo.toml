@@ -2,7 +2,7 @@
 name = "curator-desktop"
 version.workspace = true
 edition.workspace = true
-description = "Curator desktop media library"
+description = "Curator Host native media library"
 default-run = "Curator"
 
 [[bin]]

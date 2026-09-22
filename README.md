@@ -1,11 +1,11 @@
-# Curator 0.3.0
+# Curator 0.3.3
 
 Curator is a self-hosted gallery-dl library: download media you are entitled to
 access, organize it with groups/tags/ratings, and browse it locally in a
 browser or native desktop app. The backend serves only loopback and explicitly
 detected Tailscale addresses—never ordinary LAN or wildcard interfaces.
 
-Curator has three editions built from one Rust core and web frontend:
+Curator has three editions built from one Rust core:
 
 - **Curator Server** (`curator`) is the headless backend, browser UI, download
   manager, media server, and background service.
