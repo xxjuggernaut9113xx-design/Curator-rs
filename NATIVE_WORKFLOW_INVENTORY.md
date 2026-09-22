@@ -9,10 +9,10 @@
 
 ## Architecture gates
 
-- [ ] **A-01 Typed service boundary** — Extract `library`, `settings`, `discovery`, `storage`, `downloads`, `jobs`, `backup`, `export`, `media`, and `playback` services; adapters retain every path, method and format. H/S full; V scoped. Status: partial. Verify parity, authorization, validation, maintenance and shutdown.
+- [ ] **A-01 Typed service boundary** — Extract `library`, `settings`, `discovery`, `storage`, `downloads`, `jobs`, `backup`, `export`, `media`, and `playback` services; adapters retain every path, method and format. H/S full; V scoped. Status: partial. Session admission and media byte-range planning now have transport-independent services with direct/HTTP tests; the broader extraction and Viewer role negotiation remain open.
 - [ ] **A-02 Operation control** — Separate interaction, jobs, thumbnails and playback; use bounded queues, cancellation, deduplication, progress and actionable errors. Status: partial. Native Host/Viewer now use bounded regular (128), control (16), and image (1) work queues; a full regular queue reports rejected actions and a stale preview result cannot replace the current preview. The control-lane unit test covers pause admission under a full regular queue. Seek, cancellation, navigation latency, quit latency, Windows manual, and Linux manual results remain unavailable.
 - [ ] **A-03 Typed durable models** — Versioned settings, discovery capability, storage, activity, job, backup, export, media and playback models. Preserve unknown Viewer preferences. Status: partial (`db::Settings` coexists with ad-hoc JSON).
-- [ ] **A-04 Lifecycle authority** — Service boundary owns permissions, maintenance lease, library lock and shutdown; listener failure remains visible while offline H works. Status: partial. Verify occupied port, shutdown race, lock collision and disconnect.
+- [ ] **A-04 Lifecycle authority** — Service boundary owns permissions, maintenance lease, library lock and shutdown; listener failure remains visible while offline H works. Status: partial. Session start/control now share direct-service admission for maintenance and shutdown; direct and HTTP parity, shutdown denial, and direct maintenance denial have automated tests. Other operations, role permissions, occupied port, disconnect, and Windows/Linux manual results remain open.
 
 ## Shell and appearance
 
@@ -35,8 +35,8 @@
 - [ ] **P-01 Renderer** — bundle libmpv, Slint OpenGL texture plus software fallback, efficient stills and safe teardown. H/V permitted stream only. Status: absent.
 - [ ] **P-02 Controls** — video/audio/animated/still; pause, seek, duration, volume, speed, loop, fullscreen, loading/errors and workspace persistence. Status: partial (still preview/fullscreen only).
 - [ ] **P-03 Queue/clips** — reorder/remove/advance/shuffle/repeat, slideshow and boundaries; clip edit/progress/cancel/error/result. Status: partial.
-- [ ] **P-04 Remote streaming** — validated range seeking, reject redirects/nested playlists/unvalidated mpv URLs. Status: absent.
-- [ ] **P-05 Session authority** — consume deterministic Rust session effects and persist monotonic session state. Status: partial; `session.rs`/`native.rs` tests exist, native timing presentation does not.
+- [ ] **P-04 Remote streaming** — validated range seeking, reject redirects/nested playlists/unvalidated mpv URLs. Status: partial. Server now has an additive ID-based `/api/media/:id/stream` endpoint with single-range validation, 200/206/416 and HEAD behavior; Viewer still-image loads use its pinned Tailnet origin and ID. Parser and HTTP byte/header tests use a disposable library. Native libmpv use, playlist/redirect validation in the renderer, clip boundaries, role negotiation, and Windows/Linux manual results remain unavailable.
+- [ ] **P-05 Session authority** — consume deterministic Rust session effects and persist monotonic session state. Status: partial; `session.rs`/`native.rs` tests exist, and Host now calls `services::session` directly while Server retains the same session routes and payloads through adapters. Direct/HTTP parity and shutdown/maintenance admission are tested. Native timing presentation and Windows/Linux manual results remain unavailable.
 - [ ] **P-06 Modes/cues** — feed, portrait wall, review, slideshow, GOON, Cock Hero; native metronome/audio/speech, Linux speech engine, beats, soundtrack/connectors, effects, stale-cue prevention and multi-video decoder/focus policy. Status: absent.
 
 ## Manage

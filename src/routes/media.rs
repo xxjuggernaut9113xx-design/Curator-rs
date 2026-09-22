@@ -2,8 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -12,6 +14,130 @@ use serde_json::{json, Value};
 use crate::db::now_iso;
 use crate::provenance;
 use crate::AppState;
+
+/// Native clients address media by ID. The file resolver confines the path to
+/// the library and the shared range plan accepts only a single byte interval.
+pub async fn stream(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let path = match crate::media_path(&state, id) {
+        Ok(path) => path,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"Media not found"})),
+            )
+                .into_response()
+        }
+    };
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"Media not found"})),
+            )
+                .into_response()
+        }
+    };
+    let total = match file.metadata().await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"Media not found"})),
+            )
+                .into_response()
+        }
+    };
+    let range = headers.get(header::RANGE).map(HeaderValue::to_str);
+    let plan = match range {
+        None => crate::services::media::plan_range(total, None),
+        Some(Ok(value)) => crate::services::media::plan_range(total, Some(value)),
+        Some(Err(_)) => Err(crate::services::media::InvalidRange),
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(_) => {
+            let mut response = (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                Json(json!({"error":"Invalid or unsatisfiable byte range"})),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total}")).unwrap(),
+            );
+            return response;
+        }
+    };
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&plan.length.to_string()).unwrap(),
+    );
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(media_content_type(&path)),
+    );
+    response_headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    if plan.partial {
+        response_headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {}-{}/{total}", plan.start, plan.end())).unwrap(),
+        );
+    }
+    let status = if plan.partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    if method == Method::HEAD {
+        return (status, response_headers, Body::empty()).into_response();
+    }
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if file
+        .seek(std::io::SeekFrom::Start(plan.start))
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(file.take(plan.length)));
+    (status, response_headers, body).into_response()
+}
+
+fn media_content_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "m4a" | "aac" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
 
 /// Keep the operational rating definition in one SQL expression. `rating`
 /// remains a backwards-compatible cache for older clients, but every new

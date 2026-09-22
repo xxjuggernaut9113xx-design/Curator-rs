@@ -140,6 +140,14 @@ impl RemoteClient {
         Ok(url)
     }
 
+    /// Build an ID-based media URL on the pinned Tailnet peer for native playback.
+    pub fn media_stream_url(&self, id: i64) -> Result<reqwest::Url, String> {
+        if id <= 0 {
+            return Err("Invalid media ID".into());
+        }
+        self.url(&format!("/api/media/{id}/stream"))
+    }
+
     async fn bytes(
         &self,
         method: reqwest::Method,
@@ -420,7 +428,7 @@ impl Client {
 
     pub async fn session(&self) -> Result<Option<crate::session::SessionState>, String> {
         match self {
-            Self::Local(client) => Ok(client.state.sessions.snapshot()),
+            Self::Local(client) => Ok(crate::services::session::current(&client.state)),
             Self::Remote(client) => {
                 serde_json::from_value(client.request("/api/session", None).await?)
                     .map_err(|e| e.to_string())
@@ -561,24 +569,12 @@ impl Client {
                 ))
             }
             Self::Remote(client) => {
-                let filepath = item.playback_filepath.as_deref().unwrap_or(&item.filepath);
-                if filepath
-                    .split(['/', '\\'])
-                    .any(|part| part == ".." || part == ".")
-                    || filepath.starts_with(['/', '\\'])
-                {
-                    return Err("Invalid media path".into());
-                }
-                let path = format!(
-                    "/library/{}",
-                    filepath
-                        .split('/')
-                        .map(|part| urlencoding::encode(part).into_owned())
-                        .collect::<Vec<_>>()
-                        .join("/")
-                );
                 let bytes = client
-                    .bytes(reqwest::Method::GET, client.url(&path)?, None)
+                    .bytes(
+                        reqwest::Method::GET,
+                        client.media_stream_url(item.id)?,
+                        None,
+                    )
                     .await?;
                 image::ImageReader::new(std::io::Cursor::new(bytes))
             }
@@ -654,15 +650,18 @@ impl LocalClient {
         let state = State(self.state.clone());
         match command {
             Command::StartSession => serde_json::to_value(
-                self.state
-                    .sessions
-                    .start_running(crate::session::GameConfig::quick_default())?,
+                crate::services::session::start(
+                    &self.state,
+                    crate::session::GameConfig::quick_default(),
+                )
+                .map_err(|error| error.to_string())?,
             )
             .map_err(|e| e.to_string()),
-            Command::Session(control) => {
-                serde_json::to_value(self.state.sessions.control(control)?)
-                    .map_err(|e| e.to_string())
-            }
+            Command::Session(control) => serde_json::to_value(
+                crate::services::session::control(&self.state, control)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|e| e.to_string()),
             Command::CreateGroup(name) => response(
                 routes::groups::create(
                     state,
@@ -927,6 +926,11 @@ mod tests {
         }
         let client = RemoteClient::from_validated_peer("http://100.64.1.2:42168").unwrap();
         assert!(client.url("/api/media").is_ok());
+        assert_eq!(
+            client.media_stream_url(7).unwrap().as_str(),
+            "http://100.64.1.2:42168/api/media/7/stream"
+        );
+        assert!(client.media_stream_url(0).is_err());
         for path in [
             "//100.64.1.3/api/media",
             "http://127.0.0.1/api/media",

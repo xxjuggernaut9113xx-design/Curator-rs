@@ -22,6 +22,7 @@ pub mod process;
 mod provenance;
 pub mod remote;
 pub mod routes;
+pub mod services;
 pub mod session;
 mod slug;
 mod startup;

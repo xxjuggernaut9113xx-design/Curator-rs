@@ -115,6 +115,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/oobe/reset", post(oobe::reset))
         // ── Media ──────────────────────────────────────────────────────────
         .route("/api/media", get(media::list))
+        .route(
+            "/api/media/:id/stream",
+            get(media::stream).head(media::stream),
+        )
         .route("/api/media/bulk", post(media::bulk))
         .route("/api/media/:id/clips", post(clips::create))
         .route("/api/clip-jobs/:id", get(clips::status))
