@@ -61,6 +61,17 @@ struct ViewState {
     preview_request: u64,
 }
 
+impl ViewState {
+    fn navigate_to(&mut self, target: Option<(i64, bool)>) {
+        self.query.source_id = target.filter(|(_, group)| !group).map(|(id, _)| id);
+        self.query.group_id = target.filter(|(_, group)| *group).map(|(id, _)| id);
+        self.query.cursor = None;
+        self.cursor = None;
+        self.page_cursors.clear();
+        self.page_cursors.push(None);
+    }
+}
+
 const WORK_QUEUE_CAPACITY: usize = 128;
 const CONTROL_QUEUE_CAPACITY: usize = 16;
 static REJECTED_WORK: AtomicUsize = AtomicUsize::new(0);
@@ -478,16 +489,26 @@ pub fn run_ui(
         }
     });
     let v = view.clone();
+    let weak = window.as_weak();
     let tx = send.clone();
     window.on_navigate(move |index| {
         let mut state = v.borrow_mut();
-        let target = state
+        let selected = state
             .navigation
             .get(index as usize)
-            .map(|n| (n.id, n.group));
-        state.query.source_id = target.filter(|(_, group)| !group).map(|(id, _)| id);
-        state.query.group_id = target.filter(|(_, group)| *group).map(|(id, _)| id);
-        state.query.cursor = None;
+            .map(|item| (item.id, item.group, item.name.clone()));
+        state.navigate_to(selected.as_ref().map(|(id, group, _)| (*id, *group)));
+        if let Some(w) = weak.upgrade() {
+            w.set_location_title(
+                selected
+                    .map(|(_, _, name)| name)
+                    .unwrap_or_else(|| "All sources and groups".into())
+                    .into(),
+            );
+            w.set_busy(true);
+            w.set_has_more(false);
+            w.set_has_previous(false);
+        }
         let _ = tx.send(Work::Browse(state.query.clone()));
     });
     let tx = send.clone();
@@ -951,6 +972,28 @@ pub fn run_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_location_discards_the_previous_page_cursor() {
+        let mut state = ViewState::default();
+        state.query.source_id = Some(9);
+        state.query.cursor = Some("old-query".into());
+        state.cursor = Some("next-from-old-query".into());
+        state.page_cursors = vec![None, Some("old-query".into())];
+        state.navigate_to(Some((12, true)));
+        assert_eq!(state.query.source_id, None);
+        assert_eq!(state.query.group_id, Some(12));
+        assert!(state.query.cursor.is_none());
+        assert!(state.cursor.is_none());
+        assert_eq!(state.page_cursors, vec![None]);
+
+        state.navigate_to(Some((7, false)));
+        assert_eq!(state.query.source_id, Some(7));
+        assert_eq!(state.query.group_id, None);
+        state.navigate_to(None);
+        assert_eq!(state.query.source_id, None);
+        assert_eq!(state.query.group_id, None);
+    }
 
     #[test]
     fn control_lane_accepts_pause_when_regular_queue_is_full() {

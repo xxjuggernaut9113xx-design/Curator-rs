@@ -3,7 +3,7 @@ import { Button, CheckBox, ComboBox, LineEdit, ScrollView, HorizontalBox, Vertic
 export struct MediaRow { title: string, detail: string, selected: bool }
 export struct DownloadRow { label: string, phase: string }
 export component CuratorNativeWindow inherits Window {
-    title: root.local-host ? "Curator Host" : "Curator Viewer";
+    title: (root.local-host ? "Curator Host" : "Curator Viewer") + " — " + (root.workspace == 0 ? root.location-title : root.workspace == 1 ? "Player" : "Manage");
     preferred-width: 1200px; preferred-height: 800px;
     min-width: 800px; min-height: 560px;
     in-out property <int> workspace: 0;
@@ -13,6 +13,7 @@ export component CuratorNativeWindow inherits Window {
     in-out property <[string]> groups;
     in-out property <string> status;
     in-out property <string> inspector;
+    in-out property <string> location-title: "All sources and groups";
     in-out property <string> download-status;
     in-out property <[DownloadRow]> download-sources;
     in-out property <image> preview;
