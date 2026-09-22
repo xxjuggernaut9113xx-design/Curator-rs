@@ -716,9 +716,15 @@ impl LocalClient {
                 .await,
             ),
             Command::Approve(id) => response(routes::media::approve_rating(state, Path(id)).await),
-            Command::PauseDownloads => Ok(routes::downloads::pause(state).await.0),
+            Command::PauseDownloads => {
+                let result = crate::services::downloads::pause(&self.state).await;
+                if let Some(error) = result["error"].as_str() {
+                    return Err(error.into());
+                }
+                Ok(result)
+            }
             Command::ResumeDownloads => {
-                let result = routes::downloads::resume(state).await.0;
+                let result = crate::services::downloads::resume(self.state.clone()).await;
                 if let Some(error) = result["error"].as_str() {
                     return Err(error.into());
                 }

@@ -2048,7 +2048,7 @@ mod tests {
         .await
         .unwrap();
         let pid: u32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
-        let _ = crate::routes::downloads::pause(axum::extract::State(state.clone())).await;
+        let _ = crate::services::downloads::pause(&state).await;
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
             .await
             .unwrap()
@@ -2070,8 +2070,8 @@ mod tests {
             .unwrap()
             .execute("UPDATE sources SET url='https://fixture/success'", [])
             .unwrap();
-        let result = crate::routes::downloads::resume(axum::extract::State(state.clone())).await;
-        assert_eq!(result.0["requeued"], 1);
+        let result = crate::services::downloads::resume(state.clone()).await;
+        assert_eq!(result["requeued"], 1);
         state.download_tasks.close();
         state.download_tasks.wait().await;
         assert_eq!(

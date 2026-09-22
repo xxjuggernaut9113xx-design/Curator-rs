@@ -3,6 +3,8 @@
 use std::{collections::HashSet, sync::atomic::Ordering};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::Arc;
 
 use crate::AppState;
 
@@ -155,6 +157,232 @@ pub async fn status(state: &AppState) -> DownloadStatus {
     }
 }
 
+/// Pause all download sources with service-level maintenance and shutdown
+/// admission, independent of whether the caller used HTTP or the native UI.
+pub async fn pause(state: &Arc<AppState>) -> Value {
+    if state.shutdown.is_cancelled() {
+        return json!({"error":"Curator is shutting down"});
+    }
+    let Some(_lease) = state.maintenance.try_acquire_background_worker() else {
+        return json!({"error":"A local maintenance job is active"});
+    };
+    if state.shutdown.is_cancelled() {
+        return json!({"error":"Curator is shutting down"});
+    }
+    pause_unchecked(state).await
+}
+
+/// Maintenance has already closed normal admission and must pause workers as
+/// part of establishing quiescence.
+pub(crate) async fn pause_for_maintenance(state: &Arc<AppState>) -> Value {
+    pause_unchecked(state).await
+}
+
+async fn pause_unchecked(state: &Arc<AppState>) -> Value {
+    let _control = state.download_control.lock().await;
+    state.downloads_paused.store(true, Ordering::SeqCst);
+
+    if let Ok(conn) = state.pool.get() {
+        let _ = conn.execute(
+            "UPDATE sources SET status='paused',progress_updated_at=?1 WHERE status IN ('pending','retrying')",
+            [crate::db::now_iso()],
+        );
+    }
+    let procs: Vec<(i64, u32)> = {
+        let guard = state.active_processes.lock().await;
+        guard
+            .iter()
+            .map(|(&source_id, &pid)| (source_id, pid))
+            .collect()
+    };
+    for &(source_id, pid) in &procs {
+        state.paused_source_ids.lock().await.insert(source_id);
+        if let Some(cancel) = state
+            .source_cancellations
+            .lock()
+            .await
+            .get(&source_id)
+            .cloned()
+        {
+            cancel.cancel();
+        }
+        crate::downloader::kill_pid(pid).await;
+    }
+    let cancellations: Vec<(i64, tokio_util::sync::CancellationToken)> = state
+        .source_cancellations
+        .lock()
+        .await
+        .iter()
+        .filter(|(source_id, _)| !procs.iter().any(|(id, _)| id == *source_id))
+        .map(|(source_id, token)| (*source_id, token.clone()))
+        .collect();
+    for (source_id, cancel) in cancellations {
+        state.paused_source_ids.lock().await.insert(source_id);
+        cancel.cancel();
+        if let Ok(conn) = state.pool.get() {
+            let _ = conn.execute(
+                "UPDATE sources SET status='paused',progress_updated_at=?1 WHERE id=?2 AND status IN ('downloading','indexing')",
+                rusqlite::params![crate::db::now_iso(), source_id],
+            );
+        }
+    }
+    json!({"paused":true})
+}
+
+pub async fn resume(state: Arc<AppState>) -> Value {
+    if state.shutdown.is_cancelled() {
+        return json!({"error":"Curator is shutting down"});
+    }
+    let Some(_lease) = state.maintenance.try_acquire_background_worker() else {
+        return json!({"error":"A local maintenance job is active"});
+    };
+    if state.shutdown.is_cancelled() {
+        return json!({"error":"Curator is shutting down"});
+    }
+    resume_unchecked(state).await
+}
+
+pub(crate) async fn resume_after_maintenance(state: Arc<AppState>) -> Value {
+    resume_unchecked(state).await
+}
+
+async fn resume_unchecked(state: Arc<AppState>) -> Value {
+    let _control = state.download_control.lock().await;
+    while state.downloads_paused.load(Ordering::SeqCst) {
+        if state.running_sources.lock().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let paused_ids: Vec<i64> = {
+        let conn = match state.pool.get() {
+            Ok(conn) => conn,
+            Err(_) => return json!({"error":"Database unavailable"}),
+        };
+        let mut statement = match conn.prepare("SELECT id FROM sources WHERE status='paused'") {
+            Ok(statement) => statement,
+            Err(_) => return json!({"error":"Database unavailable"}),
+        };
+        statement
+            .query_map([], |row| row.get(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    };
+    if !paused_ids.is_empty() {
+        let conn = match state.pool.get() {
+            Ok(conn) => conn,
+            Err(_) => return json!({"error":"Database unavailable"}),
+        };
+        let transaction = match conn.unchecked_transaction() {
+            Ok(transaction) => transaction,
+            Err(_) => return json!({"error":"Database unavailable"}),
+        };
+        for id in &paused_ids {
+            if transaction
+                .execute(
+                    "UPDATE sources SET status='pending',queued_at=?1,progress_updated_at=?1,current_filename=NULL WHERE id=?2 AND status='paused'",
+                    rusqlite::params![crate::db::now_iso(), id],
+                )
+                .is_err()
+            {
+                return json!({"error":"Database unavailable"});
+            }
+        }
+        if transaction.commit().is_err() {
+            return json!({"error":"Database unavailable"});
+        }
+    }
+    state.paused_source_ids.lock().await.clear();
+    state.downloads_paused.store(false, Ordering::SeqCst);
+    for id in &paused_ids {
+        state
+            .download_tasks
+            .spawn(crate::downloader::run_download(Arc::clone(&state), *id));
+    }
+    json!({"paused":false,"requeued":paused_ids.len()})
+}
+
+pub async fn pause_source(state: &Arc<AppState>, id: i64) -> Value {
+    if let Some(error) = admission_error(state) {
+        return json!({"id":id,"error":error});
+    }
+    let Some(_lease) = state.maintenance.try_acquire_background_worker() else {
+        return json!({"id":id,"error":"A local maintenance job is active"});
+    };
+    if state.shutdown.is_cancelled() {
+        return json!({"id":id,"error":"Curator is shutting down"});
+    }
+    let _control = state.download_control.lock().await;
+    let exists = state
+        .pool
+        .get()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sources WHERE id=?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(false);
+    if !exists {
+        return json!({"error":"Source not found"});
+    }
+    state.paused_source_ids.lock().await.insert(id);
+    if let Some(cancel) = state.source_cancellations.lock().await.get(&id).cloned() {
+        cancel.cancel();
+    }
+    if let Some(pid) = state.active_processes.lock().await.get(&id).copied() {
+        crate::downloader::kill_pid(pid).await;
+    }
+    if let Ok(conn) = state.pool.get() {
+        let _ = conn.execute(
+            "UPDATE sources SET status='paused',progress_updated_at=?1 WHERE id=?2",
+            rusqlite::params![crate::db::now_iso(), id],
+        );
+    }
+    json!({"id":id,"paused":true})
+}
+
+pub async fn resume_source(state: Arc<AppState>, id: i64) -> Value {
+    if let Some(error) = admission_error(&state) {
+        return json!({"id":id,"error":error});
+    }
+    let Some(_lease) = state.maintenance.try_acquire_background_worker() else {
+        return json!({"id":id,"error":"A local maintenance job is active"});
+    };
+    if state.shutdown.is_cancelled() {
+        return json!({"id":id,"error":"Curator is shutting down"});
+    }
+    let _control = state.download_control.lock().await;
+    if state.downloads_paused.load(Ordering::SeqCst) {
+        return json!({"id":id,"error":"Downloads are globally paused"});
+    }
+    let changed = state.pool.get().ok().and_then(|conn| conn.execute(
+        "UPDATE sources SET status='pending',queued_at=?1,progress_updated_at=?1,current_filename=NULL WHERE id=?2 AND status IN ('paused','storage_limit','low_disk','error','done','retrying')",
+        rusqlite::params![crate::db::now_iso(),id],
+    ).ok()).unwrap_or(0);
+    if changed == 0 {
+        return json!({"id":id,"error":"Source is not resumable"});
+    }
+    state.paused_source_ids.lock().await.remove(&id);
+    state
+        .download_tasks
+        .spawn(crate::downloader::run_download(Arc::clone(&state), id));
+    json!({"id":id,"paused":false,"status":"queued"})
+}
+
+fn admission_error(state: &AppState) -> Option<&'static str> {
+    if state.shutdown.is_cancelled() {
+        Some("Curator is shutting down")
+    } else if state.maintenance.is_active() {
+        Some("A local maintenance job is active")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +391,22 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    async fn http_control(state: &AppState, path: &str) -> serde_json::Value {
+        let response = crate::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[tokio::test]
     async fn direct_and_http_status_share_the_typed_activity_snapshot() {
@@ -202,5 +446,105 @@ mod tests {
             native.downloads().await.unwrap(),
             serde_json::to_value(direct).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn global_controls_keep_http_payloads_and_deny_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::test_support::state(root.path());
+        let direct_pause = pause(&state).await;
+        assert_eq!(
+            direct_pause,
+            http_control(&state, "/api/downloads/pause").await
+        );
+        let direct_resume = resume(state.clone()).await;
+        assert_eq!(
+            direct_resume,
+            http_control(&state, "/api/downloads/resume").await
+        );
+        assert_eq!(direct_resume, json!({"paused":false,"requeued":0}));
+
+        state.shutdown.cancel();
+        assert_eq!(pause(&state).await["error"], "Curator is shutting down");
+        assert_eq!(
+            resume(state.clone()).await["error"],
+            "Curator is shutting down"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_controls_keep_http_payloads_and_global_pause_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::test_support::state(root.path());
+        crate::test_support::source(&state);
+        state.downloads_paused.store(true, Ordering::SeqCst);
+        let direct_pause = pause_source(&state, 1).await;
+        assert_eq!(
+            direct_pause,
+            http_control(&state, "/api/downloads/sources/1/pause").await
+        );
+        assert_eq!(direct_pause, json!({"id":1,"paused":true}));
+        let direct_resume = resume_source(state.clone(), 1).await;
+        assert_eq!(
+            direct_resume,
+            http_control(&state, "/api/downloads/sources/1/resume").await
+        );
+        assert_eq!(direct_resume["error"], "Downloads are globally paused");
+        assert_eq!(pause_source(&state, 999).await["error"], "Source not found");
+
+        state.shutdown.cancel();
+        assert_eq!(
+            pause_source(&state, 1).await["error"],
+            "Curator is shutting down"
+        );
+        assert_eq!(
+            resume_source(state.clone(), 1).await["error"],
+            "Curator is shutting down"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_denies_direct_global_controls() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::test_support::state(root.path());
+        state.running_sources.lock().await.insert(1);
+        state
+            .maintenance
+            .start(
+                state.clone(),
+                crate::maintenance::MaintenanceRequest {
+                    kind: crate::maintenance::MaintenanceKind::CreateBackup,
+                    backup_id: None,
+                    confirmation: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pause(&state).await["error"],
+            "A local maintenance job is active"
+        );
+        assert_eq!(
+            resume(state.clone()).await["error"],
+            "A local maintenance job is active"
+        );
+        assert_eq!(
+            pause_source(&state, 1).await["error"],
+            "A local maintenance job is active"
+        );
+        assert_eq!(
+            resume_source(state.clone(), 1).await["error"],
+            "A local maintenance job is active"
+        );
+        state.running_sources.lock().await.clear();
+        for _ in 0..100 {
+            if !state.maintenance.is_active() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!state.maintenance.is_active());
+        state.server_tasks.close();
+        state.server_tasks.wait().await;
     }
 }

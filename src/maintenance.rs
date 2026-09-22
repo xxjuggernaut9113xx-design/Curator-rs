@@ -265,7 +265,7 @@ impl MaintenanceController {
                 .set_running(&id, "Quiescing downloads and background workers.")
                 .await;
             let was_paused = state.downloads_paused.load(Ordering::Acquire);
-            let _ = crate::routes::downloads::pause(axum::extract::State(Arc::clone(&state))).await;
+            let _ = crate::services::downloads::pause_for_maintenance(&state).await;
 
             let quiesced = wait_for_quiescence(&state).await;
             let result = if quiesced {
@@ -305,7 +305,7 @@ impl MaintenanceController {
             controller.active.store(false, Ordering::Release);
             if !was_paused {
                 let _ =
-                    crate::routes::downloads::resume_after_maintenance(Arc::clone(&state)).await;
+                    crate::services::downloads::resume_after_maintenance(Arc::clone(&state)).await;
             }
         });
         Ok(job)
