@@ -531,14 +531,12 @@ impl Client {
                     Command::ResumeDownloads => ("/api/downloads/resume".into(), json!({})),
                     Command::AddSources(text) => ("/api/sources".into(), json!({"text":text})),
                     Command::ResyncAll => ("/api/sources/resync-all".into(), json!({})),
-                    Command::DeleteMedia(ids) => (
-                        "/api/media/bulk".into(),
-                        json!({"action":"delete","ids":ids}),
-                    ),
-                    Command::RefreshMetadata(ids) => (
-                        "/api/media/bulk".into(),
-                        json!({"action":"refresh_metadata","ids":ids}),
-                    ),
+                    Command::DeleteMedia(_) => {
+                        return Err("File deletion is available only on Host".into())
+                    }
+                    Command::RefreshMetadata(_) => {
+                        return Err("Local metadata refresh is available only on Host".into())
+                    }
                     Command::CreateClips { media_id, seconds } => (
                         format!("/api/media/{media_id}/clips"),
                         json!({"seconds":seconds}),
@@ -960,6 +958,22 @@ mod tests {
             .await
             .unwrap_err()
             .contains("only on the Host"));
+    }
+
+    #[tokio::test]
+    async fn viewer_cannot_delete_files_or_refresh_local_metadata() {
+        let client =
+            Client::Remote(RemoteClient::from_validated_peer("http://100.64.1.2:42168").unwrap());
+        assert!(client
+            .execute(Command::DeleteMedia(vec![1]))
+            .await
+            .unwrap_err()
+            .contains("only on Host"));
+        assert!(client
+            .execute(Command::RefreshMetadata(vec![1]))
+            .await
+            .unwrap_err()
+            .contains("only on Host"));
     }
 
     #[tokio::test]

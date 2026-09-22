@@ -27,7 +27,7 @@
 - [ ] **L-02 Query/continuity** — search, sort, media-type, tag, rating, review, size, creator, source and group filters; previous/next; preserve query, scroll and selection. Status: partial.
 - [ ] **L-03 Inspect/review** — metadata, provenance, rating, approve, undo and review actions. H/V per permission. Status: partial.
 - [ ] **L-04 Tags/organization** — media tag add/remove, inherited group tags, groups, source assignment, tag administration and source-tag review/rules. H full; V restricted. Status: partial.
-- [ ] **L-05 Bulk/file actions** — accurate selection count and limits; refresh, local import, open/reveal, deletion confirmation and non-destructive state refresh. H full; V cannot open/reveal/import/local-delete. Status: partial.
+- [ ] **L-05 Bulk/file actions** — accurate selection count and limits; refresh, local import, open/reveal, deletion confirmation and non-destructive state refresh. H full; V cannot open/reveal/import/local-delete. Status: partial. Viewer now hides file deletion and local metadata refresh, and its client denies both commands before any network request (automated denial test). Open/reveal, complete bulk UX, server-side role authority, and Windows/Linux manual results remain open.
 - [ ] **L-06 Queue actions** — replace/append Player queue and atomically retain it. H/V playback-capable only. Status: partial.
 
 ## Player, sessions and modes

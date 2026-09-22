@@ -108,9 +108,11 @@ export component CuratorNativeWindow inherits Window {
                     tags := LineEdit { placeholder-text: "Tag for selected items"; }
                     Button { text: "Add tag"; enabled: !root.busy; clicked => { root.tag(tags.text); } }
                     Button { text: "Approve suggestions"; enabled: !root.busy; clicked => { root.approve(); } }
-                    Button { text: "Refresh metadata"; enabled: !root.busy; clicked => { root.refresh-selected(); } }
-                    delete-confirmation := LineEdit { placeholder-text: "Type DELETE " + root.selected-count + " to remove files"; }
-                    Button { text: "Delete " + root.selected-count + " selected media"; enabled: !root.busy && root.selected-count > 0 && delete-confirmation.text == "DELETE " + root.selected-count; clicked => { root.delete-selected(); delete-confirmation.text = ""; } }
+                    if root.local-host: Button { text: "Refresh metadata"; enabled: !root.busy; clicked => { root.refresh-selected(); } }
+                    if root.local-host: VerticalBox {
+                        delete-confirmation := LineEdit { placeholder-text: "Type DELETE " + root.selected-count + " to remove files"; }
+                        Button { text: "Delete " + root.selected-count + " selected media"; enabled: !root.busy && root.selected-count > 0 && delete-confirmation.text == "DELETE " + root.selected-count; clicked => { root.delete-selected(); delete-confirmation.text = ""; } }
+                    }
                     Button { text: "Split selected video into 60-second clips"; enabled: !root.busy; clicked => { root.clip-selected(60); } }
                     target-group := ComboBox { model: root.groups; }
                     Button { text: "Move selection to group"; enabled: !root.busy; clicked => { root.move-to-group(target-group.current-index); } }
