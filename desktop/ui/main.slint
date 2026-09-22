@@ -1,6 +1,7 @@
 import { Button, CheckBox, ComboBox, LineEdit, ScrollView, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
 export struct MediaRow { title: string, detail: string, selected: bool }
+export struct DownloadRow { label: string, phase: string }
 export component CuratorNativeWindow inherits Window {
     title: root.local-host ? "Curator Host" : "Curator Viewer";
     preferred-width: 1200px; preferred-height: 800px;
@@ -13,6 +14,7 @@ export component CuratorNativeWindow inherits Window {
     in-out property <string> status;
     in-out property <string> inspector;
     in-out property <string> download-status;
+    in-out property <[DownloadRow]> download-sources;
     in-out property <image> preview;
     in-out property <string> playing;
     in-out property <string> session-status;
@@ -37,6 +39,7 @@ export component CuratorNativeWindow inherits Window {
     callback remove-queued(int);
     callback add-sources(string);
     callback downloads(bool);
+    callback source-download(int, bool);
     callback resync-all();
     callback refresh-manage();
     callback refresh-diagnostic-log();
@@ -188,6 +191,16 @@ export component CuratorNativeWindow inherits Window {
                 Button { text: "Resync all sources"; enabled: !root.busy; clicked => { root.resync-all(); } }
             }
             ScrollView { Text { text: root.download-status; wrap: word-wrap; } }
+            if root.local-host: ScrollView {
+                min-height: 100px;
+                VerticalBox {
+                    for entry[index] in root.download-sources: HorizontalBox {
+                        Text { text: entry.label + " — " + entry.phase; horizontal-stretch: 1; overflow: elide; }
+                        Button { text: "Pause"; enabled: entry.phase == "active" || entry.phase == "queued" || entry.phase == "indexing" || entry.phase == "retrying"; clicked => { root.source-download(index, true); } }
+                        Button { text: "Resume"; enabled: entry.phase == "paused" || entry.phase == "failed" || entry.phase == "completed" || entry.phase == "storage_limit" || entry.phase == "low_disk"; clicked => { root.source-download(index, false); } }
+                    }
+                }
+            }
             Text { text: "Discovery"; font-size: 22px; }
             HorizontalBox {
                 discovery-provider := ComboBox { model: root.discovery-providers; }

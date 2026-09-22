@@ -21,6 +21,7 @@ enum Work {
     Navigation,
     ImportFolder,
     Browse(LibraryQuery),
+    DownloadsStatus,
     ManageSnapshot,
     DiagnosticLog,
     Discover {
@@ -39,7 +40,7 @@ enum Update {
     DiagnosticLog(Result<String, String>),
     Discover(Result<serde_json::Value, String>),
     Changed(Result<(), String>),
-    Downloads(String),
+    Downloads(Result<serde_json::Value, String>),
 }
 
 #[derive(Default)]
@@ -56,6 +57,7 @@ struct ViewState {
     // Index zero is the explicit all-provider search. Subsequent entries
     // retain the API identifiers while Slint displays the human-facing name.
     discovery_provider_ids: Vec<Option<String>>,
+    download_source_ids: Vec<i64>,
     preview_request: u64,
 }
 
@@ -111,6 +113,8 @@ fn interactive_control(command: &Command) -> bool {
             | Command::Session(_)
             | Command::PauseDownloads
             | Command::ResumeDownloads
+            | Command::PauseSource(_)
+            | Command::ResumeSource(_)
     )
 }
 
@@ -309,6 +313,14 @@ pub fn run_ui(
             if control_updates.send(Update::Changed(result)).is_err() {
                 break;
             }
+            if control_updates
+                .send(Update::Downloads(
+                    control_handle.block_on(control_client.downloads()),
+                ))
+                .is_err()
+            {
+                break;
+            }
         }
     });
     // General work stays ordered. Controls and image decoding have independent
@@ -335,15 +347,9 @@ pub fn run_ui(
                     Err(error) => error,
                 };
                 let _ = updates.send(Update::Session(summary));
-                let status = match handle.block_on(worker_client.downloads()) {
-                    Ok(status) => status,
-                    Err(error) => {
-                        let _ = updates.send(Update::Downloads(error));
-                        continue;
-                    }
-                };
-                let rows = download_status_text(&status);
-                let _ = updates.send(Update::Downloads(rows));
+                let _ = updates.send(Update::Downloads(
+                    handle.block_on(worker_client.downloads()),
+                ));
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -376,6 +382,11 @@ pub fn run_ui(
             }
             Work::Browse(query) => {
                 let _ = updates.send(Update::Page(handle.block_on(worker_client.library(query))));
+            }
+            Work::DownloadsStatus => {
+                let _ = updates.send(Update::Downloads(
+                    handle.block_on(worker_client.downloads()),
+                ));
             }
             Work::ManageSnapshot => {
                 let _ = updates.send(Update::Manage(
@@ -562,6 +573,23 @@ pub fn run_ui(
         } else {
             Command::ResumeDownloads
         }]));
+    });
+    let tx = send.clone();
+    let v = view.clone();
+    window.on_source_download(move |index, pause| {
+        let id = v
+            .borrow()
+            .download_source_ids
+            .get(index.max(0) as usize)
+            .copied();
+        if let Some(id) = id {
+            let command = if pause {
+                Command::PauseSource(id)
+            } else {
+                Command::ResumeSource(id)
+            };
+            let _ = tx.send(Work::Commands(vec![command]));
+        }
     });
     let tx = send.clone();
     window.on_resync_all(move || {
@@ -833,10 +861,33 @@ pub fn run_ui(
                             let _ = tx.send(Work::Browse(v.borrow().query.clone()));
                             let _ = tx.send(Work::Navigation);
                             let _ = tx.send(Work::ManageSnapshot);
+                            let _ = tx.send(Work::DownloadsStatus);
                         }
                         Err(error) => w.set_status(error.into()),
                     },
-                    Update::Downloads(status) => w.set_download_status(status.into()),
+                    Update::Downloads(result) => match result {
+                        Ok(status) => {
+                            w.set_download_status(download_status_text(&status).into());
+                            let sources = status["sources"].as_array().cloned().unwrap_or_default();
+                            let source_rows = sources
+                                .iter()
+                                .filter_map(|row| {
+                                    Some((
+                                        row["id"].as_i64()?,
+                                        DownloadRow {
+                                            label: row["name"].as_str().unwrap_or("Unnamed source").into(),
+                                            phase: row["phase"].as_str().unwrap_or("queued").into(),
+                                        },
+                                    ))
+                                })
+                                .collect::<Vec<_>>();
+                            v.borrow_mut().download_source_ids = source_rows.iter().map(|(id, _)| *id).collect();
+                            w.set_download_sources(ModelRc::new(VecModel::from(
+                                source_rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
+                            )));
+                        }
+                        Err(error) => w.set_download_status(error.into()),
+                    },
                 }
             }
         },
@@ -912,6 +963,14 @@ mod tests {
         assert!(matches!(
             control_rx.try_recv(),
             Ok(commands) if matches!(commands.as_slice(), [Command::PauseDownloads])
+        ));
+        assert_eq!(
+            sender.send(Work::Commands(vec![Command::PauseSource(7)])),
+            EnqueueResult::Queued
+        );
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(commands) if matches!(commands.as_slice(), [Command::PauseSource(7)])
         ));
     }
 

@@ -52,6 +52,8 @@ pub enum Command {
     Approve(i64),
     PauseDownloads,
     ResumeDownloads,
+    PauseSource(i64),
+    ResumeSource(i64),
     AddSources(String),
     ResyncAll,
     DeleteMedia(Vec<i64>),
@@ -529,6 +531,9 @@ impl Client {
                     Command::Approve(id) => (format!("/api/media/{id}/rating/approve"), json!({})),
                     Command::PauseDownloads => ("/api/downloads/pause".into(), json!({})),
                     Command::ResumeDownloads => ("/api/downloads/resume".into(), json!({})),
+                    Command::PauseSource(_) | Command::ResumeSource(_) => {
+                        return Err("Per-source download control is available only on Host".into())
+                    }
                     Command::AddSources(text) => ("/api/sources".into(), json!({"text":text})),
                     Command::ResyncAll => ("/api/sources/resync-all".into(), json!({})),
                     Command::DeleteMedia(_) => {
@@ -725,6 +730,21 @@ impl LocalClient {
             }
             Command::ResumeDownloads => {
                 let result = crate::services::downloads::resume(self.state.clone()).await;
+                if let Some(error) = result["error"].as_str() {
+                    return Err(error.into());
+                }
+                Ok(result)
+            }
+            Command::PauseSource(id) => {
+                let result = crate::services::downloads::pause_source(&self.state, id).await;
+                if let Some(error) = result["error"].as_str() {
+                    return Err(error.into());
+                }
+                Ok(result)
+            }
+            Command::ResumeSource(id) => {
+                let result =
+                    crate::services::downloads::resume_source(self.state.clone(), id).await;
                 if let Some(error) = result["error"].as_str() {
                     return Err(error.into());
                 }
@@ -978,6 +998,16 @@ mod tests {
             .contains("only on Host"));
         assert!(client
             .execute(Command::RefreshMetadata(vec![1]))
+            .await
+            .unwrap_err()
+            .contains("only on Host"));
+        assert!(client
+            .execute(Command::PauseSource(1))
+            .await
+            .unwrap_err()
+            .contains("only on Host"));
+        assert!(client
+            .execute(Command::ResumeSource(1))
             .await
             .unwrap_err()
             .contains("only on Host"));
