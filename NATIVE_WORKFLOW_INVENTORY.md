@@ -23,8 +23,8 @@
 
 ## Library and editing
 
-- [ ] **L-01 Browse/hierarchy** — non-overlapping grid and table/list, bounded thumbnail cache, stable headers, source/group navigation and reassignment. H/V read-only as negotiated. Status: partial (list only).
-- [ ] **L-02 Query/continuity** — search, sort, media-type, tag, rating, review, size, creator, source and group filters; previous/next; preserve query, scroll and selection. Status: partial.
+- [ ] **L-01 Browse/hierarchy** — non-overlapping grid and table/list, bounded thumbnail cache, stable headers, source/group navigation and reassignment. H/V read-only as negotiated. Status: partial. The native Library now renders separate adaptive grid and table layouts using the saved layout value; the table header remains outside its scroller. Thumbnail cards/cache, role negotiation, and Windows/Linux visual results remain open.
+- [ ] **L-02 Query/continuity** — search, sort, media-type, tag, rating, review, size, creator, source and group filters; previous/next; preserve query, scroll and selection. Status: partial. Native Library keeps one Slint media model across selection updates and binds scroll position to window state across workspace switches. Missing filters, per-query scroll behavior, and Windows/Linux manual results remain open.
 - [ ] **L-03 Inspect/review** — metadata, provenance, rating, approve, undo and review actions. H/V per permission. Status: partial.
 - [ ] **L-04 Tags/organization** — media tag add/remove, inherited group tags, groups, source assignment, tag administration and source-tag review/rules. H full; V restricted. Status: partial.
 - [ ] **L-05 Bulk/file actions** — accurate selection count and limits; refresh, local import, open/reveal, deletion confirmation and non-destructive state refresh. H full; V cannot open/reveal/import/local-delete. Status: partial. Viewer now hides file deletion and local metadata refresh, and its client denies both commands before any network request (automated denial test). Open/reveal, complete bulk UX, server-side role authority, and Windows/Linux manual results remain open.

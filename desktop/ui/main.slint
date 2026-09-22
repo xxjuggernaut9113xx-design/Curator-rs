@@ -57,6 +57,8 @@ export component CuratorNativeWindow inherits Window {
     in-out property <string> settings-theme: "system";
     in-out property <bool> settings-tray: true;
     in-out property <string> settings-layout: "grid";
+    in-out property <length> library-scroll-y: 0px;
+    private property <int> grid-columns: root.width >= 1400px ? 4 : root.width >= 1000px ? 3 : 2;
     callback save-settings(string, bool, string);
 
     VerticalBox {
@@ -88,13 +90,40 @@ export component CuratorNativeWindow inherits Window {
                     Button { text: "All sources and groups"; clicked => { root.navigate(-1); } }
                     for name[index] in root.navigation: Button { text: name; clicked => { root.navigate(index); } }
                 } }
-                ScrollView {
+                VerticalBox {
                     vertical-stretch: 1; horizontal-stretch: 2;
-                    VerticalBox {
-                        for row[index] in root.media: HorizontalBox {
-                            CheckBox { checked: row.selected; toggled => { root.select-item(index, self.checked); } }
-                            Button { text: row.title; clicked => { root.select-item(index, !row.selected); } }
-                            Text { text: row.detail; overflow: elide; }
+                    HorizontalBox {
+                        Text { text: "Library"; font-size: 20px; horizontal-stretch: 1; }
+                        Button { text: "Grid"; primary: root.settings-layout == "grid"; clicked => { root.settings-layout = "grid"; } }
+                        Button { text: "Table"; primary: root.settings-layout == "table"; clicked => { root.settings-layout = "table"; } }
+                    }
+                    if root.settings-layout == "table": Text { text: "Select     Filename                                      Source · Type · Rating"; font-weight: 700; }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        content-y <=> root.library-scroll-y;
+                        if root.settings-layout == "table": VerticalBox {
+                            for entry[index] in root.media: HorizontalBox {
+                                CheckBox { checked: entry.selected; toggled => { root.select-item(index, self.checked); } }
+                                Button { text: entry.title; clicked => { root.select-item(index, !entry.selected); } }
+                                Text { text: entry.detail; overflow: elide; horizontal-stretch: 1; }
+                            }
+                        }
+                        if root.settings-layout == "grid": GridLayout {
+                            spacing: 8px;
+                            for entry[index] in root.media: Rectangle {
+                                row: index / root.grid-columns;
+                                col: Math.mod(index, root.grid-columns);
+                                min-width: 160px; height: 112px;
+                                background: entry.selected ? #354b68 : #242d3b;
+                                border-width: 1px;
+                                border-color: entry.selected ? #83b7ff : #566579;
+                                VerticalBox {
+                                    padding: 8px; spacing: 5px;
+                                    CheckBox { text: "Select"; checked: entry.selected; toggled => { root.select-item(index, self.checked); } }
+                                    Button { text: entry.title; clicked => { root.select-item(index, !entry.selected); } }
+                                    Text { text: entry.detail; color: #edf2fa; overflow: elide; }
+                                }
+                            }
                         }
                     }
                 }

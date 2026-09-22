@@ -4,7 +4,7 @@ use curator::native::{
     Client, Command, LibraryQuery, ManageSnapshot, MediaItem, MediaPage, NativeImage,
     NavigationItem,
 };
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -46,6 +46,7 @@ enum Update {
 struct ViewState {
     navigation: Vec<NavigationItem>,
     items: Vec<MediaItem>,
+    media_model: Rc<VecModel<MediaRow>>,
     selected: BTreeMap<i64, MediaItem>,
     queue: Vec<MediaItem>,
     query: LibraryQuery,
@@ -207,17 +208,22 @@ fn download_status_text(status: &serde_json::Value) -> String {
 
 fn render(window: &CuratorNativeWindow, state: &ViewState) {
     window.set_selected_count(state.selected.len().min(i32::MAX as usize) as i32);
-    window.set_media(ModelRc::new(VecModel::from(
-        state
-            .items
-            .iter()
-            .map(|item| MediaRow {
-                title: item.filename.clone().into(),
-                detail: format!("{} Â· {} Â· {} â˜…", item.source, item.kind, item.rating).into(),
-                selected: state.selected.contains_key(&item.id),
-            })
-            .collect::<Vec<_>>(),
-    )));
+    let rows = state
+        .items
+        .iter()
+        .map(|item| MediaRow {
+            title: item.filename.clone().into(),
+            detail: format!("{} Â· {} Â· {} â˜…", item.source, item.kind, item.rating).into(),
+            selected: state.selected.contains_key(&item.id),
+        })
+        .collect::<Vec<_>>();
+    if state.media_model.row_count() == rows.len() {
+        for (index, row) in rows.into_iter().enumerate() {
+            state.media_model.set_row_data(index, row);
+        }
+    } else {
+        state.media_model.set_vec(rows);
+    }
     window.set_queue(ModelRc::new(VecModel::from(
         state
             .queue
@@ -251,6 +257,7 @@ pub fn run_ui(
     let window = CuratorNativeWindow::new()?;
     window.set_local_host(matches!(client, Client::Local(_)));
     let view = Rc::new(RefCell::new(ViewState::default()));
+    window.set_media(ModelRc::new(view.borrow().media_model.clone()));
     let mut preferences_writable = true;
     match client.load_preferences() {
         Ok(preferences) => {
