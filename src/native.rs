@@ -173,23 +173,27 @@ impl RemoteClient {
         Ok(bytes)
     }
 
-    async fn request(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
-        let bytes = self
-            .bytes(
-                if body.is_some() {
-                    reqwest::Method::POST
-                } else {
-                    reqwest::Method::GET
-                },
-                self.url(path)?,
-                body,
-            )
-            .await?;
+    async fn request_method(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        let bytes = self.bytes(method, self.url(path)?, body).await?;
         let result: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if let Some(error) = result["error"].as_str() {
             return Err(error.into());
         }
         Ok(result)
+    }
+
+    async fn request(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
+        let method = if body.is_some() {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        self.request_method(method, path, body).await
     }
 }
 
@@ -531,7 +535,11 @@ impl Client {
                         format!("/api/media/{media_id}/clips"),
                         json!({"seconds":seconds}),
                     ),
-                    Command::UpdateSettings(value) => ("/api/settings".into(), value),
+                    Command::UpdateSettings(value) => {
+                        return client
+                            .request_method(reqwest::Method::PATCH, "/api/settings", Some(value))
+                            .await;
+                    }
                     Command::QueueSearchResults(results) => {
                         ("/api/search/download".into(), json!({"results":results}))
                     }

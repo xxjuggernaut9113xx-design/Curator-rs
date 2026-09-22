@@ -1,17 +1,30 @@
-import { Button, LineEdit, VerticalBox } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
 export component CuratorViewerWindow inherits Window {
     in-out property <string> host-name: "My Curator";
     in-out property <string> endpoint: "http://";
     in-out property <string> status: "Choose a Tailnet host.";
     in-out property <bool> busy;
+    in-out property <[string]> saved-hosts;
     callback connect(string, string);
+    callback select-saved(int);
+    callback remove-saved(int);
     title: "Curator Viewer";
     preferred-width: 760px; preferred-height: 500px; min-width: 560px; min-height: 400px;
     VerticalBox {
         padding: 24px; spacing: 14px;
         Text { text: "Curator Viewer"; font-size: 28px; font-weight: 700; }
         Text { text: "Connect to a saved Curator Host or Server on your Tailnet."; wrap: word-wrap; }
+        if root.saved-hosts.length > 0: Text { text: "Saved Hosts"; font-size: 18px; font-weight: 600; }
+        if root.saved-hosts.length > 0: ScrollView {
+            max-height: 120px;
+            VerticalBox {
+                for host[index] in root.saved-hosts: HorizontalBox {
+                    Button { text: host; enabled: !root.busy; clicked => { root.select-saved(index); } }
+                    Button { text: "Remove"; enabled: !root.busy; clicked => { root.remove-saved(index); } }
+                }
+            }
+        }
         Text { text: "Host name"; }
         LineEdit { text <=> root.host-name; }
         Text { text: "Tailnet origin"; }

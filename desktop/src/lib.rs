@@ -44,6 +44,9 @@ struct ViewState {
     cursor: Option<String>,
     page_cursors: Vec<Option<String>>,
     discovery_results: Vec<serde_json::Value>,
+    // Index zero is the explicit all-provider search. Subsequent entries
+    // retain the API identifiers while Slint displays the human-facing name.
+    discovery_provider_ids: Vec<Option<String>>,
 }
 
 fn manage_text(snapshot: &ManageSnapshot) -> String {
@@ -62,7 +65,84 @@ fn manage_text(snapshot: &ManageSnapshot) -> String {
     )
 }
 
+fn discovery_provider_options(providers: &serde_json::Value) -> (Vec<String>, Vec<Option<String>>) {
+    let mut labels = vec!["All providers".to_owned()];
+    let mut ids = vec![None];
+    for provider in providers["providers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some(id) = provider["id"].as_str() else {
+            continue;
+        };
+        let name = provider["name"].as_str().unwrap_or(id);
+        let availability = provider["availability"].as_str().unwrap_or("unknown");
+        labels.push(format!("{name} ({availability})"));
+        ids.push(Some(id.to_owned()));
+    }
+    (labels, ids)
+}
+
+fn download_status_text(status: &serde_json::Value) -> String {
+    let summary = if status["paused"].as_bool().unwrap_or(false) {
+        format!(
+            "Downloads paused · {} source(s) ready to resume",
+            status["paused_source_ids"].as_array().map_or(0, Vec::len)
+        )
+    } else {
+        format!(
+            "{} active · {} queued · {} retrying",
+            status["active_count"].as_i64().unwrap_or(0),
+            status["queued_count"].as_i64().unwrap_or(0),
+            status["retrying_count"].as_i64().unwrap_or(0),
+        )
+    };
+    let source_lines = status["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            let completed = row["completed_count"].as_i64().unwrap_or(0);
+            let total = match row["known_total"].as_i64() {
+                Some(total) => format!(
+                    "{completed} / {total} ({}%)",
+                    row["percentage"].as_f64().unwrap_or(0.0).round()
+                ),
+                None => format!("{completed} completed · total not reported"),
+            };
+            let current = row["current_filename"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!(" · {value}"))
+                .unwrap_or_default();
+            let retry = row["retry_at"]
+                .as_i64()
+                .map(|value| format!(" · retry at {value}"))
+                .unwrap_or_default();
+            let error = row["error"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!(" · error: {value}"))
+                .unwrap_or_default();
+            format!(
+                "{} — {} · {}{}{}{}",
+                row["name"].as_str().unwrap_or("Unnamed source"),
+                row["phase"].as_str().unwrap_or("queued"),
+                total,
+                current,
+                retry,
+                error,
+            )
+        });
+    std::iter::once(summary)
+        .chain(source_lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn render(window: &CuratorNativeWindow, state: &ViewState) {
+    window.set_selected_count(state.selected.len().min(i32::MAX as usize) as i32);
     window.set_media(ModelRc::new(VecModel::from(
         state
             .items
@@ -158,22 +238,7 @@ pub fn run_ui(
                         continue;
                     }
                 };
-                let rows = status["sources"]
-                    .as_array()
-                    .map(|rows| {
-                        rows.iter()
-                            .map(|row| {
-                                format!(
-                                    "{} â€” {} ({} completed)",
-                                    row["name"].as_str().unwrap_or(""),
-                                    row["phase"].as_str().unwrap_or(""),
-                                    row["completed_count"]
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
+                let rows = download_status_text(&status);
                 let _ = updates.send(Update::Downloads(rows));
                 continue;
             }
@@ -411,12 +476,18 @@ pub fn run_ui(
         let _ = tx.send(Work::DiagnosticLog);
     });
     let tx = send.clone();
-    window.on_discover(move |query, provider| {
+    let v = view.clone();
+    window.on_discover(move |query, provider_index| {
         if !query.trim().is_empty() {
+            let provider = v
+                .borrow()
+                .discovery_provider_ids
+                .get(provider_index.max(0) as usize)
+                .cloned()
+                .flatten();
             let _ = tx.send(Work::Discover {
                 query: query.to_string(),
-                provider: (!provider.trim().is_empty() && provider != "All providers")
-                    .then(|| provider.to_string()),
+                provider,
             });
         }
     });
@@ -433,6 +504,18 @@ pub fn run_ui(
         let _ = tx.send(Work::Commands(vec![Command::UpdateSettings(
             serde_json::json!({"theme": theme.to_string()}),
         )]));
+    });
+    let tx = send.clone();
+    let local_host = matches!(client, Client::Local(_));
+    window.on_save_settings(move |theme, keep_running_in_tray, library_layout| {
+        let mut settings = serde_json::json!({
+            "theme": theme.trim(),
+            "library_layout": library_layout.to_string(),
+        });
+        if local_host {
+            settings["keep_running_in_tray"] = serde_json::json!(keep_running_in_tray);
+        }
+        let _ = tx.send(Work::Commands(vec![Command::UpdateSettings(settings)]));
     });
     let tx = send.clone();
     let v = view.clone();
@@ -577,7 +660,31 @@ pub fn run_ui(
                         }
                     }
                     Update::Manage(result) => match result {
-                        Ok(snapshot) => w.set_manage_status(manage_text(&snapshot).into()),
+                        Ok(snapshot) => {
+                            w.set_settings_theme(
+                                snapshot.settings["theme"]
+                                    .as_str()
+                                    .unwrap_or("system")
+                                    .into(),
+                            );
+                            w.set_settings_tray(
+                                snapshot.settings["keep_running_in_tray"]
+                                    .as_bool()
+                                    .unwrap_or(true),
+                            );
+                            w.set_settings_layout(
+                                snapshot.settings["library_layout"]
+                                    .as_str()
+                                    .unwrap_or("grid")
+                                    .into(),
+                            );
+                            let (labels, ids) = discovery_provider_options(&snapshot.providers);
+                            v.borrow_mut().discovery_provider_ids = ids;
+                            w.set_discovery_providers(ModelRc::new(VecModel::from(
+                                labels.into_iter().map(Into::into).collect::<Vec<_>>(),
+                            )));
+                            w.set_manage_status(manage_text(&snapshot).into());
+                        }
                         Err(error) => w.set_manage_status(error.into()),
                     },
                     Update::DiagnosticLog(result) => {
@@ -638,6 +745,7 @@ pub fn run_ui(
         let _ = recovery_send.send(Work::Recovery(request));
     });
     let _ = send.send(Work::Navigation);
+    let _ = send.send(Work::ManageSnapshot);
     window.invoke_browse(
         "All media".into(),
         "date_desc".into(),
@@ -667,4 +775,44 @@ pub fn run_ui(
     let _ = worker.join();
     save_result?;
     result.map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_options_show_provider_names_but_send_stable_ids() {
+        let (labels, ids) = discovery_provider_options(&serde_json::json!({
+            "providers": [{
+                "id": "gallery_dl_adapter",
+                "name": "Example Gallery",
+                "availability": "direct_url_only"
+            }]
+        }));
+        assert_eq!(
+            labels,
+            vec![
+                "All providers".to_owned(),
+                "Example Gallery (direct_url_only)".to_owned()
+            ]
+        );
+        assert_eq!(ids, vec![None, Some("gallery_dl_adapter".into())]);
+    }
+
+    #[test]
+    fn download_status_explains_known_and_inaccurate_totals() {
+        let text = download_status_text(&serde_json::json!({
+            "active_count": 1,
+            "queued_count": 2,
+            "retrying_count": 0,
+            "sources": [
+                {"name": "Known", "phase": "active", "completed_count": 3, "known_total": 10, "percentage": 30.0, "current_filename": "clip.mp4"},
+                {"name": "Unknown", "phase": "indexing", "completed_count": 7, "known_total": null}
+            ]
+        }));
+        assert!(text.contains("1 active · 2 queued · 0 retrying"));
+        assert!(text.contains("3 / 10 (30%) · clip.mp4"));
+        assert!(text.contains("7 completed · total not reported"));
+    }
 }

@@ -40,7 +40,8 @@ export component CuratorNativeWindow inherits Window {
     callback resync-all();
     callback refresh-manage();
     callback refresh-diagnostic-log();
-    callback discover(string, string);
+    in-out property <[string]> discovery-providers: ["All providers"];
+    callback discover(string, int);
     callback queue-discovery();
     callback save-theme(string);
     callback delete-selected();
@@ -51,11 +52,19 @@ export component CuratorNativeWindow inherits Window {
     in-out property <string> manage-status;
     in-out property <string> diagnostic-log;
     in-out property <string> discovery-status;
+    in-out property <int> selected-count;
+    in-out property <bool> settings-open: false;
+    in-out property <string> settings-theme: "system";
+    in-out property <bool> settings-tray: true;
+    in-out property <string> settings-layout: "grid";
+    callback save-settings(string, bool, string);
 
     VerticalBox {
         padding: 16px; spacing: 12px;
         HorizontalBox {
             Text { text: "Curator"; font-size: 28px; font-weight: 700; }
+            Button { text: "File"; clicked => { root.workspace = 0; } }
+            Button { text: "Tools"; clicked => { root.workspace = 2; } }
             for label[index] in ["Library", "Player", "Manage"]: Button {
                 text: label; primary: root.workspace == index;
                 clicked => { root.workspace = index; }
@@ -91,7 +100,7 @@ export component CuratorNativeWindow inherits Window {
                 }
                 VerticalBox {
                     horizontal-stretch: 1;
-                    Text { text: "Selection"; font-size: 20px; }
+                    Text { text: "Selection (" + root.selected-count + ")"; font-size: 20px; }
                     Text { text: root.inspector; wrap: word-wrap; }
                     HorizontalBox {
                         for stars in [1, 2, 3, 4, 5]: Button { text: stars + " ★"; enabled: !root.busy; clicked => { root.rate(stars); } }
@@ -100,7 +109,8 @@ export component CuratorNativeWindow inherits Window {
                     Button { text: "Add tag"; enabled: !root.busy; clicked => { root.tag(tags.text); } }
                     Button { text: "Approve suggestions"; enabled: !root.busy; clicked => { root.approve(); } }
                     Button { text: "Refresh metadata"; enabled: !root.busy; clicked => { root.refresh-selected(); } }
-                    Button { text: "Delete selected media"; enabled: !root.busy; clicked => { root.delete-selected(); } }
+                    delete-confirmation := LineEdit { placeholder-text: "Type DELETE " + root.selected-count + " to remove files"; }
+                    Button { text: "Delete " + root.selected-count + " selected media"; enabled: !root.busy && root.selected-count > 0 && delete-confirmation.text == "DELETE " + root.selected-count; clicked => { root.delete-selected(); delete-confirmation.text = ""; } }
                     Button { text: "Split selected video into 60-second clips"; enabled: !root.busy; clicked => { root.clip-selected(60); } }
                     target-group := ComboBox { model: root.groups; }
                     Button { text: "Move selection to group"; enabled: !root.busy; clicked => { root.move-to-group(target-group.current-index); } }
@@ -149,9 +159,9 @@ export component CuratorNativeWindow inherits Window {
             ScrollView { Text { text: root.download-status; wrap: word-wrap; } }
             Text { text: "Discovery"; font-size: 22px; }
             HorizontalBox {
-                discovery-provider := ComboBox { model: ["All providers", "local", "balbums"]; }
+                discovery-provider := ComboBox { model: root.discovery-providers; }
                 discovery-query := LineEdit { placeholder-text: "Find collections, creators, or a page URL"; }
-                Button { text: "Search"; enabled: !root.busy; clicked => { root.discover(discovery-query.text, discovery-provider.current-value); } }
+                Button { text: "Search"; enabled: !root.busy; clicked => { root.discover(discovery-query.text, discovery-provider.current-index); } }
                 Button { text: "Queue compatible results"; enabled: !root.busy; clicked => { root.queue-discovery(); } }
             }
             ScrollView { min-height: 100px; Text { text: root.discovery-status; wrap: word-wrap; } }
@@ -159,6 +169,7 @@ export component CuratorNativeWindow inherits Window {
             HorizontalBox {
                 theme := ComboBox { model: ["system", "atelier-dark", "midnight", "ember", "linen", "sage", "aurora", "oled"]; }
                 Button { text: "Save native theme"; enabled: !root.busy; clicked => { root.save-theme(theme.current-value); } }
+                Button { text: "Settings…"; enabled: !root.busy; clicked => { root.settings-open = true; } }
                 Button { text: "Refresh diagnostics"; clicked => { root.refresh-manage(); } }
                 Button { text: "View diagnostic log"; clicked => { root.refresh-diagnostic-log(); } }
             }
@@ -180,5 +191,40 @@ export component CuratorNativeWindow inherits Window {
             }
         }
         Text { text: root.status; wrap: word-wrap; }
+    }
+
+    // Settings has its own scroll area and a footer kept outside that area,
+    // so Save and Cancel stay reachable on compact displays.
+    if root.settings-open: Rectangle {
+        x: 32px; y: 32px; width: parent.width - 64px; height: parent.height - 64px;
+        background: #202633; border-radius: 10px; border-width: 1px; border-color: #8b98b3;
+        VerticalBox {
+            padding: 18px; spacing: 10px;
+            Text { text: "Settings"; font-size: 24px; font-weight: 700; color: #f3f6fc; }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 10px;
+                    Text { text: "General"; font-size: 18px; color: #f3f6fc; }
+                    tray := CheckBox { text: "Keep Curator running in the tray"; checked: root.settings-tray; enabled: root.local-host; }
+                    Text { text: "Media & Storage"; font-size: 18px; color: #f3f6fc; }
+                    Text { text: "Download and cache limits are enforced by the Host service."; wrap: word-wrap; color: #d5dced; }
+                    Text { text: "Appearance"; font-size: 18px; color: #f3f6fc; }
+                    theme-value := LineEdit { text: root.settings-theme; placeholder-text: "Theme"; }
+                    layout-value := ComboBox { model: ["grid", "table"]; current-value: root.settings-layout; }
+                    Text { text: "Playback & GOON"; font-size: 18px; color: #f3f6fc; }
+                    Text { text: "Playback, session, speech, and soundtrack preferences are retained by the service."; wrap: word-wrap; color: #d5dced; }
+                    Text { text: "Automation"; font-size: 18px; color: #f3f6fc; }
+                    Text { text: "Classification remains opt-in and reports blocked dependencies in Local Admin."; wrap: word-wrap; color: #d5dced; }
+                    if root.local-host: Text { text: "Local Admin"; font-size: 18px; color: #f3f6fc; }
+                    if root.local-host: Text { text: "Backups, recovery, and diagnostics are available on Manage."; wrap: word-wrap; color: #d5dced; }
+                }
+            }
+            HorizontalBox {
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "Cancel"; clicked => { root.settings-open = false; } }
+                Button { text: "Save"; primary: true; enabled: !root.busy; clicked => { root.save-settings(theme-value.text, tray.checked, layout-value.current-value); root.settings-open = false; } }
+            }
+        }
     }
 }

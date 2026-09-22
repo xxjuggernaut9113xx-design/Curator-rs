@@ -5,8 +5,9 @@
 slint::include_modules!();
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::IpAddr,
     path::PathBuf,
     time::Duration,
@@ -19,11 +20,17 @@ struct SavedHost {
     name: String,
     endpoint: String,
     instance_id: String,
+    /// Keep preferences introduced by a newer Viewer build intact when an
+    /// older build merely changes a host name or endpoint.
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, Value>,
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HostStore {
     #[serde(default)]
     hosts: Vec<SavedHost>,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, Value>,
 }
 #[derive(Deserialize)]
 struct SystemInfo {
@@ -85,28 +92,40 @@ fn load_hosts() -> Result<HostStore, String> {
         Err(error) => Err(error.to_string()),
     }
 }
-fn save_host(host: SavedHost) -> Result<(), String> {
-    let mut store = load_hosts()?;
-    if let Some(previous) = store
-        .hosts
-        .iter_mut()
-        .find(|item| item.instance_id == host.instance_id)
-    {
-        *previous = host;
-    } else {
-        store.hosts.push(host);
-    }
+fn write_hosts(store: &HostStore) -> Result<(), String> {
     use std::io::Write;
     let path = preferences_path()?;
     let parent = path.parent().ok_or("Invalid Viewer preferences path")?;
     let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
-    serde_json::to_writer_pretty(&mut file, &store).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(&mut file, store).map_err(|error| error.to_string())?;
     file.flush().map_err(|error| error.to_string())?;
     file.as_file()
         .sync_all()
         .map_err(|error| error.to_string())?;
     file.persist(path).map_err(|error| error.to_string())?;
     Ok(())
+}
+fn save_host(mut host: SavedHost) -> Result<(), String> {
+    let mut store = load_hosts()?;
+    if let Some(previous) = store
+        .hosts
+        .iter_mut()
+        .find(|item| item.instance_id == host.instance_id)
+    {
+        host.extra = std::mem::take(&mut previous.extra);
+        *previous = host;
+    } else {
+        store.hosts.push(host);
+    }
+    write_hosts(&store)
+}
+fn remove_host(index: usize) -> Result<(), String> {
+    let mut store = load_hosts()?;
+    if index >= store.hosts.len() {
+        return Err("The saved Host no longer exists.".into());
+    }
+    store.hosts.remove(index);
+    write_hosts(&store)
 }
 fn normalized_endpoint(raw: &str) -> Result<reqwest::Url, String> {
     let mut url = reqwest::Url::parse(raw.trim())
@@ -280,6 +299,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = tx.send((name.to_string(), endpoint.to_string(), result));
         });
     });
+    let weak = window.as_weak();
+    window.on_select_saved(move |index| {
+        let Ok(store) = load_hosts() else {
+            return;
+        };
+        let Some(host) = store.hosts.get(index as usize) else {
+            return;
+        };
+        if let Some(w) = weak.upgrade() {
+            w.set_host_name(host.name.clone().into());
+            w.set_endpoint(host.endpoint.clone().into());
+            w.set_status(format!("Selected saved Host: {}", host.name).into());
+        }
+    });
+    let weak = window.as_weak();
+    window.on_remove_saved(move |index| match remove_host(index as usize) {
+        Ok(()) => {
+            if let Some(w) = weak.upgrade() {
+                match load_hosts() {
+                    Ok(store) => {
+                        w.set_saved_hosts(slint::ModelRc::new(slint::VecModel::from(
+                            store
+                                .hosts
+                                .iter()
+                                .map(|host| format!("{} — {}", host.name, host.endpoint).into())
+                                .collect::<Vec<slint::SharedString>>(),
+                        )));
+                        w.set_status("Saved Host removed.".into());
+                    }
+                    Err(error) => w.set_status(error.into()),
+                }
+            }
+        }
+        Err(error) => {
+            if let Some(w) = weak.upgrade() {
+                w.set_status(error.into());
+            }
+        }
+    });
     let timer = slint::Timer::default();
     let weak = window.as_weak();
     let target = selected.clone();
@@ -310,6 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         name,
                         endpoint,
                         instance_id,
+                        extra: BTreeMap::new(),
                     })?;
                     *target.borrow_mut() = Some(client);
                     w.hide().map_err(|e| e.to_string())?;
@@ -324,6 +383,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     match load_hosts() {
         Ok(store) => {
+            window.set_saved_hosts(slint::ModelRc::new(slint::VecModel::from(
+                store
+                    .hosts
+                    .iter()
+                    .map(|host| format!("{} — {}", host.name, host.endpoint).into())
+                    .collect::<Vec<slint::SharedString>>(),
+            )));
             if let Some(host) = store.hosts.first() {
                 window.set_host_name(host.name.clone().into());
                 window.set_endpoint(host.endpoint.clone().into());
@@ -353,6 +419,26 @@ mod tests {
                 .unwrap()
                 .port(),
             Some(DEFAULT_PORT)
+        );
+    }
+
+    #[test]
+    fn saved_hosts_preserve_unknown_fields_during_migration() {
+        let store: HostStore = serde_json::from_value(serde_json::json!({
+            "hosts": [{
+                "name": "Desk",
+                "endpoint": "http://100.64.1.2:42168",
+                "instance_id": "library-1",
+                "future_host_preference": {"reconnect": true}
+            }],
+            "future_store_preference": "kept"
+        }))
+        .unwrap();
+        let value = serde_json::to_value(store).unwrap();
+        assert_eq!(value["future_store_preference"], "kept");
+        assert_eq!(
+            value["hosts"][0]["future_host_preference"]["reconnect"],
+            true
         );
     }
 }
