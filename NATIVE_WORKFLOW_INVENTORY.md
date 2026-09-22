@@ -10,7 +10,7 @@
 ## Architecture gates
 
 - [ ] **A-01 Typed service boundary** — Extract `library`, `settings`, `discovery`, `storage`, `downloads`, `jobs`, `backup`, `export`, `media`, and `playback` services; adapters retain every path, method and format. H/S full; V scoped. Status: partial. Verify parity, authorization, validation, maintenance and shutdown.
-- [ ] **A-02 Operation control** — Separate interaction, jobs, thumbnails and playback; use bounded queues, cancellation, deduplication, progress and actionable errors. Status: partial. Verify slow work cannot delay pause, seek, navigation or quit.
+- [ ] **A-02 Operation control** — Separate interaction, jobs, thumbnails and playback; use bounded queues, cancellation, deduplication, progress and actionable errors. Status: partial. Native Host/Viewer now use bounded regular (128), control (16), and image (1) work queues; a full regular queue reports rejected actions and a stale preview result cannot replace the current preview. The control-lane unit test covers pause admission under a full regular queue. Seek, cancellation, navigation latency, quit latency, Windows manual, and Linux manual results remain unavailable.
 - [ ] **A-03 Typed durable models** — Versioned settings, discovery capability, storage, activity, job, backup, export, media and playback models. Preserve unknown Viewer preferences. Status: partial (`db::Settings` coexists with ad-hoc JSON).
 - [ ] **A-04 Lifecycle authority** — Service boundary owns permissions, maintenance lease, library lock and shutdown; listener failure remains visible while offline H works. Status: partial. Verify occupied port, shutdown race, lock collision and disconnect.
 

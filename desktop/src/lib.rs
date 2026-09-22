@@ -5,13 +5,21 @@ use curator::native::{
     NavigationItem,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::mpsc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
 
 enum Work {
     Recovery(Option<curator::maintenance::MaintenanceRequest>),
     Navigation,
     ImportFolder,
-    Image(MediaItem),
     Browse(LibraryQuery),
     ManageSnapshot,
     DiagnosticLog,
@@ -25,7 +33,7 @@ enum Update {
     Recovery(Result<String, String>),
     Session(String),
     Navigation(Result<Vec<NavigationItem>, String>),
-    Image(String, Result<NativeImage, String>),
+    Image(u64, String, Result<NativeImage, String>),
     Page(Result<MediaPage, String>),
     Manage(Result<ManageSnapshot, String>),
     DiagnosticLog(Result<String, String>),
@@ -47,6 +55,62 @@ struct ViewState {
     // Index zero is the explicit all-provider search. Subsequent entries
     // retain the API identifiers while Slint displays the human-facing name.
     discovery_provider_ids: Vec<Option<String>>,
+    preview_request: u64,
+}
+
+const WORK_QUEUE_CAPACITY: usize = 128;
+const CONTROL_QUEUE_CAPACITY: usize = 16;
+static REJECTED_WORK: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone)]
+struct WorkSender {
+    regular: mpsc::SyncSender<Work>,
+    control: mpsc::SyncSender<Vec<Command>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnqueueResult {
+    Queued,
+    Full,
+    Closed,
+}
+
+impl WorkSender {
+    // Slint callbacks must never wait for a full background queue.
+    fn send(&self, work: Work) -> EnqueueResult {
+        let result = match work {
+            Work::Commands(commands) if commands.iter().all(interactive_control) => self
+                .control
+                .try_send(commands)
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(commands) => {
+                        mpsc::TrySendError::Full(Work::Commands(commands))
+                    }
+                    mpsc::TrySendError::Disconnected(commands) => {
+                        mpsc::TrySendError::Disconnected(Work::Commands(commands))
+                    }
+                }),
+            work => self.regular.try_send(work),
+        };
+        match result {
+            Ok(()) => EnqueueResult::Queued,
+            Err(mpsc::TrySendError::Full(_)) => {
+                REJECTED_WORK.fetch_add(1, Ordering::Relaxed);
+                EnqueueResult::Full
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => EnqueueResult::Closed,
+        }
+    }
+}
+
+fn interactive_control(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::StartSession
+            | Command::Session(_)
+            | Command::PauseDownloads
+            | Command::ResumeDownloads
+    )
 }
 
 fn manage_text(snapshot: &ManageSnapshot) -> String {
@@ -203,12 +267,45 @@ pub fn run_ui(
             window.set_status(format!("Could not restore preferences: {error}").into());
         }
     }
-    let (send, receive) = mpsc::channel();
+    let (regular, receive) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
+    let (control, control_receive) = mpsc::sync_channel(CONTROL_QUEUE_CAPACITY);
+    let send = WorkSender { regular, control };
+    let (image_send, image_receive) = mpsc::sync_channel::<(u64, MediaItem)>(1);
     let (updates, inbox) = mpsc::channel();
+    let image_client = client.clone();
+    let image_handle = runtime.handle().clone();
+    let image_updates = updates.clone();
+    let image_worker = std::thread::spawn(move || {
+        while let Ok((request, item)) = image_receive.recv() {
+            let image = image_handle.block_on(image_client.image(&item));
+            if image_updates
+                .send(Update::Image(request, item.filename, image))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     let worker_client = client.clone();
     let handle = runtime.handle().clone();
-    // A single worker preserves command order and keeps SQLite, cancellation,
-    // and network work off Slint's event thread. No UI callback blocks on Tokio.
+    let control_client = client.clone();
+    let control_handle = runtime.handle().clone();
+    let control_updates = updates.clone();
+    let control_worker = std::thread::spawn(move || {
+        while let Ok(commands) = control_receive.recv() {
+            let result = control_handle.block_on(async {
+                for command in commands {
+                    control_client.execute(command).await?;
+                }
+                Ok(())
+            });
+            if control_updates.send(Update::Changed(result)).is_err() {
+                break;
+            }
+        }
+    });
+    // General work stays ordered. Controls and image decoding have independent
+    // bounded lanes so slow discovery or preview work cannot fill their queues.
     let worker = std::thread::spawn(move || loop {
         let work = match receive.recv_timeout(Duration::from_secs(2)) {
             Ok(work) => work,
@@ -269,10 +366,6 @@ pub fn run_ui(
                         .map(|_| ());
                     let _ = updates.send(Update::Changed(result));
                 }
-            }
-            Work::Image(item) => {
-                let image = handle.block_on(worker_client.image(&item));
-                let _ = updates.send(Update::Image(item.filename, image));
             }
             Work::Browse(query) => {
                 let _ = updates.send(Update::Page(handle.block_on(worker_client.library(query))));
@@ -575,11 +668,18 @@ pub fn run_ui(
     });
     let weak = window.as_weak();
     let v = view.clone();
-    let tx = send.clone();
+    let image_tx = image_send.clone();
     window.on_play(move |index| {
-        if let (Some(item), Some(w)) = (v.borrow().queue.get(index as usize), weak.upgrade()) {
-            w.set_playing(format!("Loading {}…", item.filename).into());
-            let _ = tx.send(Work::Image(item.clone()));
+        let mut state = v.borrow_mut();
+        if let (Some(item), Some(w)) = (state.queue.get(index as usize).cloned(), weak.upgrade()) {
+            let request = state.preview_request.wrapping_add(1);
+            let title = item.filename.clone();
+            if image_tx.try_send((request, item)).is_ok() {
+                state.preview_request = request;
+                w.set_playing(format!("Loading {title}…").into());
+            } else {
+                w.set_status("Player preview is busy; try again shortly.".into());
+            }
         }
     });
     let timer = slint::Timer::default();
@@ -593,6 +693,11 @@ pub fn run_ui(
             let Some(w) = weak.upgrade() else {
                 return;
             };
+            let rejected = REJECTED_WORK.swap(0, Ordering::Relaxed);
+            if rejected > 0 {
+                w.set_busy(false);
+                w.set_status(format!("Background queue is full; {rejected} action(s) were not queued. Retry shortly.").into());
+            }
             while let Ok(update) = inbox.try_recv() {
                 match update {
                     Update::Recovery(result) => {
@@ -625,7 +730,7 @@ pub fn run_ui(
                         }
                         Err(error) => w.set_status(error.into()),
                     },
-                    Update::Image(title, result) => match result {
+                    Update::Image(request, title, result) if request == v.borrow().preview_request => match result {
                         Ok(image) => {
                             let buffer =
                                 slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
@@ -642,6 +747,7 @@ pub fn run_ui(
                             w.set_status(error.into());
                         }
                     },
+                    Update::Image(..) => {},
                     Update::Page(result) => {
                         w.set_busy(false);
                         match result {
@@ -772,7 +878,10 @@ pub fn run_ui(
     drop(timer);
     drop(window);
     drop(send);
+    drop(image_send);
     let _ = worker.join();
+    let _ = control_worker.join();
+    let _ = image_worker.join();
     save_result?;
     result.map_err(Into::into)
 }
@@ -780,6 +889,24 @@ pub fn run_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_lane_accepts_pause_when_regular_queue_is_full() {
+        let (regular, regular_rx) = mpsc::sync_channel(1);
+        let (control, control_rx) = mpsc::sync_channel(1);
+        let sender = WorkSender { regular, control };
+        assert_eq!(sender.send(Work::Navigation), EnqueueResult::Queued);
+        assert_eq!(sender.send(Work::ManageSnapshot), EnqueueResult::Full);
+        assert_eq!(
+            sender.send(Work::Commands(vec![Command::PauseDownloads])),
+            EnqueueResult::Queued
+        );
+        assert!(matches!(regular_rx.try_recv(), Ok(Work::Navigation)));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(commands) if matches!(commands.as_slice(), [Command::PauseDownloads])
+        ));
+    }
 
     #[test]
     fn discovery_options_show_provider_names_but_send_stable_ids() {
