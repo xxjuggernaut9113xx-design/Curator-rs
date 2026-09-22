@@ -746,9 +746,13 @@ pub fn run_ui(
                                     .iter()
                                     .map(|n| {
                                         format!(
-                                            "{}: {}",
+                                            "{}{}: {} ({})",
+                                            "› ".repeat(n.depth),
                                             if n.group { "Group" } else { "Source" },
-                                            n.name
+                                            n.name,
+                                            n.media_count
+                                                .map(|count| count.to_string())
+                                                .unwrap_or_else(|| "?".into())
                                         )
                                         .into()
                                     })

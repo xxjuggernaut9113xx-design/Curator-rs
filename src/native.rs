@@ -217,6 +217,114 @@ pub struct NavigationItem {
     pub id: i64,
     pub name: String,
     pub group: bool,
+    pub media_count: Option<i64>,
+    pub depth: usize,
+}
+
+fn navigation_items(sources: &Value, groups: &Value, summary: &Value) -> Vec<NavigationItem> {
+    #[derive(Clone)]
+    struct Node {
+        id: i64,
+        name: String,
+        parent_id: Option<i64>,
+        group: bool,
+    }
+    fn rows(value: &Value, key: &str, parent_key: &str, group: bool) -> Vec<Node> {
+        value[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                Some(Node {
+                    id: row["id"].as_i64()?,
+                    name: row["name"].as_str()?.to_owned(),
+                    parent_id: row[parent_key].as_i64(),
+                    group,
+                })
+            })
+            .collect()
+    }
+    fn append_group(
+        group: &Node,
+        depth: usize,
+        groups: &[Node],
+        sources: &[Node],
+        summary: &Value,
+        visited: &mut std::collections::HashSet<i64>,
+        output: &mut Vec<NavigationItem>,
+    ) {
+        if !visited.insert(group.id) {
+            return;
+        }
+        output.push(navigation_item(group, depth, summary));
+        for child in groups
+            .iter()
+            .filter(|child| child.parent_id == Some(group.id))
+        {
+            append_group(child, depth + 1, groups, sources, summary, visited, output);
+        }
+        for source in sources
+            .iter()
+            .filter(|source| source.parent_id == Some(group.id))
+        {
+            output.push(navigation_item(source, depth + 1, summary));
+        }
+    }
+    fn navigation_item(node: &Node, depth: usize, summary: &Value) -> NavigationItem {
+        let key = if node.group { "groups" } else { "sources" };
+        NavigationItem {
+            id: node.id,
+            name: node.name.clone(),
+            group: node.group,
+            media_count: summary[key]
+                .as_array()
+                .and_then(|counts| counts.iter().find(|entry| entry["id"] == node.id))
+                .and_then(|entry| entry["items"].as_i64()),
+            depth,
+        }
+    }
+    let groups = rows(groups, "groups", "parent_id", true);
+    let sources = rows(sources, "sources", "group_id", false);
+    let mut output = Vec::with_capacity(groups.len() + sources.len());
+    let mut visited = std::collections::HashSet::new();
+    for group in groups.iter().filter(|group| {
+        group.parent_id.is_none()
+            || !groups
+                .iter()
+                .any(|candidate| Some(candidate.id) == group.parent_id)
+    }) {
+        append_group(
+            group,
+            0,
+            &groups,
+            &sources,
+            summary,
+            &mut visited,
+            &mut output,
+        );
+    }
+    // Legacy cyclic groups have no root; show them once rather than hiding
+    // their sources or recursing indefinitely.
+    for group in &groups {
+        append_group(
+            group,
+            0,
+            &groups,
+            &sources,
+            summary,
+            &mut visited,
+            &mut output,
+        );
+    }
+    for source in sources.iter().filter(|source| {
+        source.parent_id.is_none()
+            || !groups
+                .iter()
+                .any(|group| Some(group.id) == source.parent_id)
+    }) {
+        output.push(navigation_item(source, 0, summary));
+    }
+    output
 }
 
 #[derive(Serialize, Deserialize)]
@@ -438,31 +546,21 @@ impl Client {
         }
     }
     pub async fn navigation(&self) -> Result<Vec<NavigationItem>, String> {
-        let (sources, groups) = match self {
+        let (sources, groups, summary) = match self {
             Self::Local(client) => (
                 response(routes::sources::list(State(client.state.clone())).await)?,
                 response(routes::groups::list(State(client.state.clone())).await)?,
+                crate::library_summary(&client.state)
+                    .await
+                    .map_err(|error| error.to_string())?,
             ),
             Self::Remote(client) => (
                 client.request("/api/sources", None).await?,
                 client.request("/api/groups", None).await?,
+                client.request("/api/library/summary", None).await?,
             ),
         };
-        let mut items = Vec::new();
-        for (kind, value) in [("source", sources), ("group", groups)] {
-            if let Some(rows) = value[format!("{kind}s")].as_array() {
-                for row in rows {
-                    if let (Some(id), Some(name)) = (row["id"].as_i64(), row["name"].as_str()) {
-                        items.push(NavigationItem {
-                            id,
-                            name: name.into(),
-                            group: kind == "group",
-                        });
-                    }
-                }
-            }
-        }
-        Ok(items)
+        Ok(navigation_items(&sources, &groups, &summary))
     }
     pub async fn library(&self, query: LibraryQuery) -> Result<MediaPage, String> {
         match self {
@@ -817,6 +915,59 @@ impl LocalClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_navigation_counts_match_server_library_summary() {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::test_support::state(root.path());
+        crate::test_support::source(&state);
+        state
+            .pool
+            .get()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO groups(id,name,added_at) VALUES(10,'Parent','now');
+             INSERT INTO groups(id,name,parent_id,added_at) VALUES(11,'Child',10,'now');
+             UPDATE sources SET group_id=11 WHERE id=1;",
+            )
+            .unwrap();
+        state.pool.get().unwrap().execute(
+            "INSERT INTO media(id,source_id,filepath,filename,type,added_at) VALUES(1,1,'test/a.jpg','a.jpg','image','now')",
+            [],
+        ).unwrap();
+        let navigation = Client::Local(LocalClient::new((*state).clone()).unwrap())
+            .navigation()
+            .await
+            .unwrap();
+        let source = navigation
+            .iter()
+            .find(|item| !item.group && item.id == 1)
+            .unwrap();
+        assert_eq!(source.media_count, Some(1));
+        assert_eq!(source.depth, 2);
+        assert_eq!(navigation[0].id, 10);
+        assert_eq!(navigation[0].depth, 0);
+        assert_eq!(navigation[1].id, 11);
+        assert_eq!(navigation[1].depth, 1);
+        assert_eq!(navigation[1].media_count, Some(1));
+
+        let response = crate::router((*state).clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/library/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let summary: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(summary["sources"][0]["items"], source.media_count.unwrap());
+    }
     use crate::test_support;
     use tower::ServiceExt;
 

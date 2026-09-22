@@ -16,7 +16,7 @@
 
 ## Shell and appearance
 
-- [ ] **U-01 Native shell** — File/Tools menus; Library, Player, Manage; source/group tree/counts/Add source; location title, compact navigation and contextual actions. H/V as permitted. Status: absent.
+- [ ] **U-01 Native shell** — File/Tools menus; Library, Player, Manage; source/group tree/counts/Add source; location title, compact navigation and contextual actions. H/V as permitted. Status: partial. The shell has Library, Player, Manage and nested source/group navigation; media counts come from the shared library summary, with native/HTTP parity and nested ordering tested. Menus, contextual actions, location title, compact navigation, role negotiation, and Windows/Linux manual results remain open.
 - [ ] **U-02 Manage destinations** — direct Discover, Organization, Activity and Settings navigation with retained state. H/V as permitted. Status: absent.
 - [ ] **U-03 Settings dialog** — General, Media & Storage, Appearance, Playback & GOON, Automation, Local Admin; vertical navigation, independent scroll and fixed Save/Cancel. H full; V device preferences. Status: absent.
 - [ ] **U-04 Theme/accessibility** — supported palettes as Slint tokens that update every component. Status: partial (value persists but components do not theme). Verify contrast, focus, font/window/display scaling on Windows/Linux.
