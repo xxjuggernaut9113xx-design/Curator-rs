@@ -85,10 +85,10 @@ pub async fn stats(
 }
 
 // ─── GET /api/log ────────────────────────────────────────────────────────────
-// Streams the last 5000 lines of curator.log as plain text.
+// Streams the last 5000 lines of the current redacted diagnostic log as plain text.
 
 pub async fn get_log(State(state): State<Arc<AppState>>) -> Response {
-    let tail = read_log_tail(&state.log_path, 5000);
+    let tail = crate::services::diagnostics::read_tail(&state.log_path, 5000).unwrap_or_default();
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -115,7 +115,10 @@ pub async fn source_log(
         },
     );
     match row {
-        Ok((log, err_msg)) => Ok(Json(json!({ "log": log, "error_message": err_msg }))),
+        Ok((log, err_msg)) => Ok(Json(json!({
+            "log": log.map(|text| crate::services::diagnostics::redact(&text)),
+            "error_message": err_msg.map(|text| crate::services::diagnostics::redact(&text)),
+        }))),
         Err(_) => Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "Source not found"})),
@@ -124,12 +127,3 @@ pub async fn source_log(
 }
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
-
-fn read_log_tail(path: &std::path::Path, max_lines: usize) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join("\n")
-}

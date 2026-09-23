@@ -196,27 +196,31 @@ pub struct AppState {
 fn setup_logging(log_path: &std::path::Path) {
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-    let file_appender = tracing_appender::rolling::never(
-        log_path.parent().unwrap_or(std::path::Path::new(".")),
-        log_path
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new("curator.log")),
-    );
+    let file_appender = services::diagnostics::rotating_file_writer(log_path)
+        .expect("create rotating diagnostic log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     // Keep _guard alive for the process lifetime
     std::mem::forget(_guard);
+    let (stdout, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+    std::mem::forget(stdout_guard);
 
-    // Capture diagnostic detail by default in both stdout and curator.log.
-    // An explicit RUST_LOG remains authoritative for users who need a quieter
-    // filter or narrower module selection.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    // Detail is opt-in through RUST_LOG; ordinary runs record information only.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::io::stdout))
-        .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+        .with(fmt::layer().with_writer(services::diagnostics::RedactingMakeWriter(stdout)))
+        .with(
+            fmt::layer()
+                .with_writer(services::diagnostics::RedactingMakeWriter(non_blocking))
+                .with_ansi(false),
+        )
         .try_init()
         .ok();
+    eprintln!(
+        "Diagnostic logs: {} (daily rotation, eight retained; set RUST_LOG before launch for detail)",
+        log_path.parent().unwrap_or(std::path::Path::new(".")).display()
+    );
 }
 
 fn load_or_create_instance_id(data_dir: &std::path::Path) -> Result<String> {

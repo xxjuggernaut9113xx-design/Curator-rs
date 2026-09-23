@@ -73,6 +73,7 @@ pub struct ManageSnapshot {
     pub stats: Value,
     pub providers: Value,
     pub remote_access: Value,
+    pub log_location: String,
 }
 
 #[derive(Clone)]
@@ -350,34 +351,13 @@ impl Default for NativePreferences {
 
 impl Client {
     pub async fn diagnostic_log(&self) -> Result<String, String> {
-        const MAX_LOG_BYTES: usize = 512 * 1024;
-        let bytes = match self {
+        match self {
             Self::Local(client) => {
-                let metadata =
-                    std::fs::metadata(&client.state.log_path).map_err(|error| error.to_string())?;
-                let mut file = std::fs::File::open(&client.state.log_path)
-                    .map_err(|error| error.to_string())?;
-                use std::io::{Read, Seek, SeekFrom};
-                let start = metadata.len().saturating_sub(MAX_LOG_BYTES as u64);
-                file.seek(SeekFrom::Start(start))
-                    .map_err(|error| error.to_string())?;
-                let mut bytes = Vec::with_capacity((metadata.len() - start) as usize);
-                file.read_to_end(&mut bytes)
-                    .map_err(|error| error.to_string())?;
-                bytes
+                crate::services::diagnostics::read_tail(&client.state.log_path, 5000)
+                    .map_err(|error| error.to_string())
             }
-            Self::Remote(client) => {
-                client
-                    .bytes(reqwest::Method::GET, client.url("/api/log")?, None)
-                    .await?
-            }
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        Ok(if bytes.len() == MAX_LOG_BYTES {
-            format!("… log truncated to the latest {MAX_LOG_BYTES} bytes …\n{text}")
-        } else {
-            text.into_owned()
-        })
+            Self::Remote(_) => Err("Diagnostic logs are available only on Host".into()),
+        }
     }
 
     pub async fn manage_snapshot(&self) -> Result<ManageSnapshot, String> {
@@ -400,6 +380,9 @@ impl Client {
                     routes::remote::status(State(client.state.clone())).await.0,
                 )
                 .map_err(|error| error.to_string())?,
+                log_location: crate::services::diagnostics::location(&client.state.log_path)
+                    .display()
+                    .to_string(),
             }),
             Self::Remote(client) => Ok(ManageSnapshot {
                 settings: client.request("/api/settings", None).await?,
@@ -407,6 +390,7 @@ impl Client {
                 stats: client.request("/api/stats", None).await?,
                 providers: client.request("/api/search/providers", None).await?,
                 remote_access: client.request("/api/remote-access", None).await?,
+                log_location: "Host diagnostic log (path available on Host only)".into(),
             }),
         }
     }

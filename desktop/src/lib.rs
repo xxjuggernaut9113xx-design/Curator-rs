@@ -136,12 +136,13 @@ fn manage_text(snapshot: &ManageSnapshot) -> String {
         .as_array()
         .map_or(0, Vec::len);
     format!(
-        "Library: {} media · {} sources · {} groups · {} tags\nDownloads: {} active · {} errors\nStorage: {}\nDiscovery: {} providers\nRemote access: {}",
+        "Library: {} media · {} sources · {} groups · {} tags\nDownloads: {} active · {} errors\nStorage: {}\nDiscovery: {} providers\nRemote access: {}\nDiagnostic log: {}",
         stats["total_media"], stats["total_sources"], stats["total_groups"], stats["total_tags"],
         stats["sources_downloading"], stats["sources_error"],
         storage["total_bytes"].as_u64().map(|bytes| format!("{bytes} bytes")).unwrap_or_else(|| "calculating".into()),
         providers,
         snapshot.remote_access["status"].as_str().unwrap_or("unavailable"),
+        snapshot.log_location,
     )
 }
 

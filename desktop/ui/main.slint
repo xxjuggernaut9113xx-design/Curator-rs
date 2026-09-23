@@ -216,7 +216,7 @@ export component CuratorNativeWindow inherits Window {
                 Button { text: "Save native theme"; enabled: !root.busy; clicked => { root.save-theme(theme.current-value); } }
                 Button { text: "Settings…"; enabled: !root.busy; clicked => { root.settings-open = true; } }
                 Button { text: "Refresh diagnostics"; clicked => { root.refresh-manage(); } }
-                Button { text: "View diagnostic log"; clicked => { root.refresh-diagnostic-log(); } }
+                if root.local-host: Button { text: "View diagnostic log"; clicked => { root.refresh-diagnostic-log(); } }
             }
             ScrollView { min-height: 100px; Text { text: root.manage-status; wrap: word-wrap; } }
             ScrollView { min-height: 100px; Text { text: root.diagnostic-log; wrap: word-wrap; } }

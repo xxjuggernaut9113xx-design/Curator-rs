@@ -74,6 +74,16 @@ factory reset are staged for restart. Backups cover database/configuration,
 not downloaded media; factory reset preserves media, archives, managed P-HAR
 files, and backups unless their separate delete control is chosen.
 
+## Diagnostics
+
+Host shows the current diagnostic log path under Manage → Settings. Server
+prints its diagnostic log directory at startup. Logs rotate daily and retain
+eight files. Secret shaped values are redacted before file output; existing
+logs are redacted again when read through the native view or `/api/log`.
+Normal runs log at `info` level. Set `RUST_LOG=debug` before starting Host or
+Server to opt into more detail. Viewer cannot open the Host diagnostic log
+through its native interface.
+
 ## Appearance and layout
 
 The app uses one primary scroller per view, an independent sidebar scroller,

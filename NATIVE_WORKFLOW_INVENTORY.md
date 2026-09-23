@@ -59,7 +59,7 @@
 
 ## Compatibility and verification
 
-- [ ] **C-01 Diagnostics** — rotating redacted logs, opt-in verbosity and visible locations. Status: partial.
+- [ ] **C-01 Diagnostics** — rotating redacted logs, opt-in verbosity and visible locations. Status: implemented; manual verification pending. Host and Server now use daily rotation with eight retained files, redact secret-shaped values before persistent output, default to `info` with explicit `RUST_LOG` opt-in, and show the log location in Host Manage or Server startup output. The shared diagnostics service bounds and redacts native/HTTP log reads, including source errors; Viewer native log access is denied. Windows and Linux manual results remain unavailable.
 - [ ] **C-02 Bundles** — libmpv for both editions; ffmpeg/ffprobe/isolated gallery-dl for H; install-relative resolution/overrides, pinned checksums/notices and packaging failure on missing tools. Status: absent.
 - [ ] **C-03 Installers** — collision-free Windows NSIS/MSI and Linux Debian/AppImage with identity/scope/upgrade/uninstall-data guarantees. Status: partial (binaries only).
 - [ ] **V-01 Evidence ledger** — each record requires direct-service/HTTP tests, H/V permission test and Windows/Linux manual result with disposable libraries. Existing tests cover backend/session/pagination/browser/package contracts; no native UI/install evidence exists.
