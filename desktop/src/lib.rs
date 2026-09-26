@@ -10,7 +10,7 @@ use player::{NativePlayer, PlayerCommand, PlayerStatus};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     rc::Rc,
     sync::{
@@ -64,12 +64,34 @@ enum Work {
     },
     SaveSettings(serde_json::Value),
     Commands(Vec<Command>),
+    /// A single command whose JSON result the UI needs back (review rating
+    /// tokens), rather than a fire-and-forget refresh.
+    ReviewCommand(Command),
+    /// A paginated library fetch owned by feed/review/GOON. These never touch
+    /// the library grid's browse state.
+    LibraryPage {
+        query: Box<LibraryQuery>,
+        request: u64,
+        kind: PageKind,
+    },
+}
+/// Which workflow owns a LibraryPage fetch. Keeps feed, review, and GOON
+/// paging independent of each other and of the library grid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageKind {
+    Feed,
+    Review,
+    Goon,
 }
 enum Update {
     Recovery(Result<RecoverySnapshot, String>),
     Navigation(Result<Vec<NavigationItem>, String>),
     Image(u64, String, Result<NativeImage, String>),
-    Page(u64, Result<MediaPage, String>),
+    Page(
+        u64,
+        Result<MediaPage, String>,
+        HashMap<i64, std::path::PathBuf>,
+    ),
     Manage(Result<ManageSnapshot, String>),
     DiagnosticLog(Result<String, String>),
     Discover(Result<serde_json::Value, String>),
@@ -79,6 +101,12 @@ enum Update {
     Changed(Result<(), String>),
     Downloads(Result<serde_json::Value, String>),
     PreferenceError(String),
+    ReviewDone(Result<serde_json::Value, String>),
+    LibraryPage {
+        kind: PageKind,
+        request: u64,
+        result: Result<MediaPage, String>,
+    },
 }
 
 #[derive(Default)]
@@ -88,6 +116,12 @@ struct ViewState {
     media_model: Rc<VecModel<MediaRow>>,
     selected: BTreeMap<i64, MediaItem>,
     queue: Vec<MediaItem>,
+    /// Queue repeats from the top after the last item when enabled.
+    queue_repeat: bool,
+    /// Cached thumbnail paths per media id, generated on the worker thread.
+    thumbs: HashMap<i64, std::path::PathBuf>,
+    /// Decoded Slint images, so a page re-render never re-decodes JPEGs.
+    thumb_images: HashMap<i64, slint::Image>,
     query: LibraryQuery,
     cursor: Option<String>,
     page_cursors: Vec<Option<String>>,
@@ -102,6 +136,110 @@ struct ViewState {
     preference_extras: BTreeMap<String, serde_json::Value>,
     settings: serde_json::Value,
     backup_ids: Vec<String>,
+    player: PlayerHolder,
+    feed: FeedState,
+    review: ReviewState,
+    goon: GoonState,
+}
+
+/// Which workflow currently owns the native player. Only one driver advances
+/// playback at a time; manual queue play preempts the automated modes.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum PlayDriver {
+    #[default]
+    Queue,
+    Feed,
+    Review,
+    Goon,
+}
+
+#[derive(Default)]
+struct PlayerHolder {
+    player: NativePlayer,
+    driver: PlayDriver,
+    /// Index into `ViewState.queue` when driven by the manual queue.
+    queue_index: Option<usize>,
+    /// Whether mpv currently holds the media (false for still-image preview).
+    video_active: bool,
+    /// Set when an ended event has already advanced the workflow, so a stale
+    /// flag cannot double-advance.
+    ended_handled: bool,
+    /// Last position/volume the Rust side reported to the Slint sliders. The
+    /// sliders echo every change back through `player-control`, so these guard
+    /// our own updates from being re-sent as seeks.
+    last_reported_position: f64,
+    last_reported_volume: f64,
+}
+
+struct FeedState {
+    active: bool,
+    candidates: VecDeque<MediaItem>,
+    /// Items already shown; the recycle pool once fresh media is exhausted.
+    seen_pool: Vec<MediaItem>,
+    seen_ids: HashSet<i64>,
+    /// Recently shown ids, so repeats never land back-to-back.
+    recent: VecDeque<i64>,
+    current: Option<MediaItem>,
+    current_is_image: bool,
+    image_deadline: Option<Instant>,
+    request: u64,
+    cursor: Option<String>,
+    exhausted: bool,
+    fetching: bool,
+    max_clip_secs: f64,
+    image_dwell: Duration,
+}
+
+impl Default for FeedState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            candidates: VecDeque::new(),
+            seen_pool: Vec::new(),
+            seen_ids: HashSet::new(),
+            recent: VecDeque::new(),
+            current: None,
+            current_is_image: false,
+            image_deadline: None,
+            request: 0,
+            cursor: None,
+            exhausted: false,
+            fetching: false,
+            max_clip_secs: 60.0,
+            image_dwell: Duration::from_secs(3),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReviewState {
+    active: bool,
+    queue: VecDeque<MediaItem>,
+    current: Option<MediaItem>,
+    /// (item snapshot before mutation, reviewed-at undo token)
+    undo_stack: Vec<(MediaItem, String)>,
+    /// Undo in flight: restored on completion, pushed back on failure.
+    pending_undo: Option<(MediaItem, String)>,
+    request: u64,
+    cursor: Option<String>,
+    exhausted: bool,
+    fetching: bool,
+    countdown: Option<Instant>,
+    busy: bool,
+}
+
+#[derive(Default)]
+struct GoonState {
+    media_enabled: bool,
+    last_phase: Option<String>,
+    last_session: Option<String>,
+    candidates: VecDeque<MediaItem>,
+    recent: VecDeque<i64>,
+    request: u64,
+    cursor: Option<String>,
+    exhausted: bool,
+    fetching: bool,
+    current: Option<MediaItem>,
 }
 
 impl ViewState {
@@ -252,6 +390,627 @@ fn session_text(state: Option<&curator::session::SessionState>) -> String {
         text.push_str(&format!("\n{instruction}"));
     }
     text
+}
+
+// ─── Native player plumbing ────────────────────────────────────────────────
+
+/// Animated stills (gif/webp) play through mpv so they animate; every other
+/// image kind decodes into the Slint preview pane.
+fn is_animated_preview(item: &MediaItem) -> bool {
+    let name = item
+        .filepath
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(item.filepath.as_str());
+    let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(extension.as_str(), "gif" | "webp")
+}
+
+fn apply_player_status(
+    window: &CuratorNativeWindow,
+    holder: &mut PlayerHolder,
+    status: PlayerStatus,
+) {
+    // Update the echo guards before touching the Slint sliders: setting the
+    // properties fires their `changed` handlers synchronously, which would
+    // otherwise re-send our own progress as a seek.
+    holder.last_reported_position = status.position_secs;
+    holder.last_reported_volume = status.volume;
+    window.set_player_status(status.message.clone().into());
+    window.set_player_progress(status.position_secs as f32);
+    window.set_player_duration(status.duration_secs as f32);
+    window.set_player_volume(status.volume as f32);
+    window.set_player_speed(status.speed as f32);
+    window.set_player_paused(status.paused);
+    window.set_player_looping(status.looping);
+}
+
+/// Starts one media item on the shared player. Images decode into the Slint
+/// preview pane; everything else loads into mpv. Returns an error when the
+/// item cannot start so feed/review/GOON can skip to a ready alternate.
+fn play_media_item(
+    window: &CuratorNativeWindow,
+    state: &mut ViewState,
+    client: &Client,
+    image_tx: &mpsc::SyncSender<(u64, MediaItem)>,
+    item: &MediaItem,
+    driver: PlayDriver,
+) -> Result<(), String> {
+    state.player.driver = driver;
+    state.player.ended_handled = false;
+    state.player.last_reported_position = 0.0;
+    window.set_player_progress(0.0);
+    window.set_player_duration(0.0);
+    if item.kind == "image" && !is_animated_preview(item) {
+        state.player.video_active = false;
+        let status = state.player.player.apply(PlayerCommand::Stop);
+        state.preview_request = state.preview_request.wrapping_add(1);
+        let request = state.preview_request;
+        window.set_playing(format!("Loading {}…", item.filename).into());
+        if image_tx.try_send((request, item.clone())).is_err() {
+            return Err("Player preview is busy; try again shortly.".into());
+        }
+        apply_player_status(window, &mut state.player, status);
+        return Ok(());
+    }
+    state.player.video_active = true;
+    window.set_preview(slint::Image::default());
+    let source = client.playback_source(item)?;
+    let status = state.player.player.apply(PlayerCommand::Load { source });
+    window.set_playing(item.filename.clone().into());
+    apply_player_status(window, &mut state.player, status.clone());
+    if status.message.starts_with("Could not start")
+        || status.message.contains("not a file")
+        || status.message.contains("No mpv")
+        || status.message.contains("did not expose its IPC endpoint")
+    {
+        return Err(status.message);
+    }
+    Ok(())
+}
+
+/// Advances the manual queue after an item genuinely ends.
+fn advance_queue(
+    window: &CuratorNativeWindow,
+    state: &mut ViewState,
+    client: &Client,
+    image_tx: &mpsc::SyncSender<(u64, MediaItem)>,
+) {
+    // Walk forward from the item after the current one, wrapping once when
+    // repeat is on. Broken entries are skipped iteratively: recursing here
+    // overflowed the stack when every entry failed, and repeat could loop
+    // forever on an all-broken queue. One bounded pass tries each entry at
+    // most once, then the queue stops.
+    let len = state.queue.len();
+    let start = state.player.queue_index.map(|index| index + 1).unwrap_or(0);
+    let mut tried = 0;
+    while tried < len {
+        let index = if state.queue_repeat {
+            (start + tried) % len
+        } else {
+            let index = start + tried;
+            if index >= len {
+                break;
+            }
+            index
+        };
+        tried += 1;
+        let item = state.queue[index].clone();
+        state.player.queue_index = Some(index);
+        match play_media_item(window, state, client, image_tx, &item, PlayDriver::Queue) {
+            Ok(()) => return,
+            Err(error) => {
+                window.set_status(format!("Skipping {}: {error}", item.filename).into());
+            }
+        }
+    }
+    state.player.queue_index = None;
+    state.player.video_active = false;
+    let status = state.player.player.apply(PlayerCommand::Stop);
+    apply_player_status(window, &mut state.player, status);
+    window.set_player_status(
+        if len == 0 {
+            "Queue is empty"
+        } else if tried >= len {
+            "Queue finished: no playable entries"
+        } else {
+            "Queue finished"
+        }
+        .into(),
+    );
+}
+
+// ─── Feed ────────────────────────────────────────────────────────────────
+
+fn feed_page_query(cursor: Option<String>) -> LibraryQuery {
+    LibraryQuery {
+        search: None,
+        cursor,
+        media_type: None,
+        sort: "date_desc".into(),
+        rating_status: None,
+        max_rating: None,
+        source_id: None,
+        group_id: None,
+        tag: None,
+        tags: None,
+        any_tags: None,
+        exclude_tags: None,
+        creator: None,
+        min_size: None,
+        max_size: None,
+        unknown_size: None,
+    }
+}
+
+/// Ordered browsing candidate: playable, not effective-rating 1, not seen this
+/// run, and within the maximum clip length when the duration is known.
+fn feed_accepts(feed: &FeedState, item: &MediaItem) -> bool {
+    if item.rating == 1 || feed.seen_ids.contains(&item.id) {
+        return false;
+    }
+    if item.kind == "video" {
+        if let Some(duration) = item.duration_secs {
+            if duration > feed.max_clip_secs {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn feed_note_seen(feed: &mut FeedState, item: &MediaItem) {
+    if feed.seen_ids.insert(item.id) {
+        feed.seen_pool.push(item.clone());
+    }
+    feed.recent.push_back(item.id);
+    while feed.recent.len() > 10 {
+        feed.recent.pop_front();
+    }
+}
+
+/// Pure feed selection: the next fresh candidate that passes the filters,
+/// or a recycled seen item once fresh media runs out. Returns `None` when
+/// the feed has nothing to show at all. Playback stays in `feed_advance`.
+fn feed_select_next(feed: &mut FeedState) -> Option<MediaItem> {
+    // Rejected heads are dropped; scanning continues through the remaining
+    // fresh candidates instead of jumping to recycled items early.
+    while let Some(item) = feed.candidates.pop_front() {
+        if !feed.recent.contains(&item.id) && feed_accepts(feed, &item) {
+            return Some(item);
+        }
+    }
+    // Fresh media exhausted: recycle shown items, avoiding the current item
+    // and recent ids where possible.
+    let current_id = feed.current.as_ref().map(|item| item.id);
+    feed.seen_pool
+        .iter()
+        .rev()
+        .find(|item| Some(item.id) != current_id && !feed.recent.contains(&item.id))
+        .or_else(|| {
+            feed.seen_pool
+                .iter()
+                .rev()
+                .find(|item| Some(item.id) != current_id)
+        })
+        .cloned()
+}
+
+fn feed_top_up(window: &CuratorNativeWindow, state: &mut ViewState, tx: &WorkSender) {
+    if state.feed.fetching || state.feed.exhausted {
+        return;
+    }
+    state.feed.fetching = true;
+    state.feed.request = state.feed.request.wrapping_add(1);
+    let request = state.feed.request;
+    let cursor = state.feed.cursor.clone();
+    let _ = tx.send(Work::LibraryPage {
+        query: Box::new(feed_page_query(cursor)),
+        request,
+        kind: PageKind::Feed,
+    });
+    window.set_feed_status("Loading feed…".into());
+}
+
+fn feed_start(window: &CuratorNativeWindow, state: &mut ViewState, tx: &WorkSender) {
+    // Feed preempts the manual queue and review; the GOON driver only retakes
+    // the player on a phase change.
+    state.player.queue_index = None;
+    state.review.active = false;
+    state.review.current = None;
+    state.review.countdown = None;
+    let feed = &mut state.feed;
+    feed.active = true;
+    feed.candidates.clear();
+    feed.seen_pool.clear();
+    feed.seen_ids.clear();
+    feed.recent.clear();
+    feed.current = None;
+    feed.image_deadline = None;
+    feed.cursor = None;
+    feed.exhausted = false;
+    feed.fetching = false;
+    window.set_review_status("Start review to rate unreviewed media".into());
+    feed_top_up(window, state, tx);
+}
+
+/// Shows the next ready feed item, skipping media that will not start and
+/// recycling shown items once fresh media runs out. Returns false when the
+/// feed has nothing to show at all.
+fn feed_advance(
+    window: &CuratorNativeWindow,
+    state: &mut ViewState,
+    client: &Client,
+    image_tx: &mpsc::SyncSender<(u64, MediaItem)>,
+    tx: &WorkSender,
+) -> bool {
+    if !state.feed.active {
+        return false;
+    }
+    // Keep a buffer of upcoming candidates while pages remain.
+    if state.feed.candidates.len() < 8 {
+        feed_top_up(window, state, tx);
+    }
+    loop {
+        let Some(next) = feed_select_next(&mut state.feed) else {
+            if state.feed.exhausted && !state.feed.fetching {
+                window.set_feed_status("Feed is out of media.".into());
+            }
+            return false;
+        };
+        match play_media_item(window, state, client, image_tx, &next, PlayDriver::Feed) {
+            Ok(()) => {
+                let is_image = next.kind == "image" && !is_animated_preview(&next);
+                state.feed.current = Some(next.clone());
+                state.feed.current_is_image = is_image;
+                state.feed.image_deadline =
+                    is_image.then(|| Instant::now() + state.feed.image_dwell);
+                feed_note_seen(&mut state.feed, &next);
+                window.set_feed_status(format!("Feed · {}", next.filename).into());
+                return true;
+            }
+            Err(error) => {
+                window.set_status(format!("Feed skipped {}: {error}", next.filename).into());
+                feed_note_seen(&mut state.feed, &next);
+            }
+        }
+    }
+}
+
+// ─── Review ──────────────────────────────────────────────────────────────
+
+fn review_page_query(cursor: Option<String>) -> LibraryQuery {
+    LibraryQuery {
+        search: None,
+        cursor,
+        media_type: None,
+        // Oldest first keeps the review queue stable while items drop out.
+        sort: "default".into(),
+        rating_status: Some("needs_review".into()),
+        max_rating: None,
+        source_id: None,
+        group_id: None,
+        tag: None,
+        tags: None,
+        any_tags: None,
+        exclude_tags: None,
+        creator: None,
+        min_size: None,
+        max_size: None,
+        unknown_size: None,
+    }
+}
+
+fn review_top_up(window: &CuratorNativeWindow, state: &mut ViewState, tx: &WorkSender) {
+    if state.review.fetching || state.review.exhausted {
+        return;
+    }
+    state.review.fetching = true;
+    state.review.request = state.review.request.wrapping_add(1);
+    let request = state.review.request;
+    let cursor = state.review.cursor.clone();
+    let _ = tx.send(Work::LibraryPage {
+        query: Box::new(review_page_query(cursor)),
+        request,
+        kind: PageKind::Review,
+    });
+    window.set_review_status("Loading review queue…".into());
+}
+
+fn review_start(window: &CuratorNativeWindow, state: &mut ViewState, tx: &WorkSender) {
+    // Review preempts the manual queue and feed.
+    state.player.queue_index = None;
+    state.feed.active = false;
+    state.feed.current = None;
+    state.feed.image_deadline = None;
+    let review = &mut state.review;
+    review.active = true;
+    review.queue.clear();
+    review.current = None;
+    review.undo_stack.clear();
+    review.cursor = None;
+    review.exhausted = false;
+    review.fetching = false;
+    review.countdown = None;
+    review.busy = false;
+    review_top_up(window, state, tx);
+}
+
+/// Activates the head of the review queue. Returns false when empty.
+fn review_activate(
+    window: &CuratorNativeWindow,
+    state: &mut ViewState,
+    client: &Client,
+    image_tx: &mpsc::SyncSender<(u64, MediaItem)>,
+) -> bool {
+    loop {
+        let Some(item) = state.review.queue.pop_front() else {
+            state.review.current = None;
+            state.review.countdown = None;
+            if state.review.exhausted && !state.review.fetching {
+                window.set_review_status("Review queue is empty.".into());
+            }
+            return false;
+        };
+        match play_media_item(window, state, client, image_tx, &item, PlayDriver::Review) {
+            Ok(()) => {
+                let auto = item
+                    .auto_rating
+                    .map(|rating| rating.to_string())
+                    .unwrap_or_else(|| "–".into());
+                let source = item.rating_source.as_deref().unwrap_or("–");
+                state.review.current = Some(item.clone());
+                // Ten seconds to decide, mirroring the browser workflow.
+                state.review.countdown = Some(Instant::now() + Duration::from_secs(10));
+                window.set_review_status(
+                    format!(
+                        "AUTO {auto} ({source}) · Needs review — {remaining} remaining",
+                        remaining = state.review.queue.len()
+                    )
+                    .into(),
+                );
+                return true;
+            }
+            Err(error) => {
+                window.set_status(format!("Review skipped {}: {error}", item.filename).into());
+            }
+        }
+    }
+}
+
+/// Skip without mutating: the item stays in the queue for later.
+fn review_requeue_current(review: &mut ReviewState) {
+    if let Some(current) = review.current.take() {
+        review.queue.push_back(current);
+    }
+}
+
+/// Move the latest undo snapshot into the in-flight slot. Returns the
+/// snapshot when an undo actually started; None when an undo is already
+/// in flight or the stack is empty.
+fn review_begin_undo(review: &mut ReviewState) -> Option<(MediaItem, String)> {
+    if review.pending_undo.is_some() {
+        return None;
+    }
+    review.undo_stack.pop().inspect(|entry| {
+        review.pending_undo = Some(entry.clone());
+    })
+}
+
+/// Settle an in-flight undo. On success the pre-mutation snapshot is
+/// returned so the caller can make it current again; on failure the
+/// snapshot goes back on the stack and None is returned.
+fn review_finish_undo(review: &mut ReviewState, succeeded: bool) -> Option<MediaItem> {
+    let (item, token) = review.pending_undo.take()?;
+    if succeeded {
+        Some(item)
+    } else {
+        review.undo_stack.push((item, token));
+        None
+    }
+}
+
+/// Skip without mutating: the item stays in the queue for later.
+fn review_skip(
+    window: &CuratorNativeWindow,
+    state: &mut ViewState,
+    client: &Client,
+    image_tx: &mpsc::SyncSender<(u64, MediaItem)>,
+    tx: &WorkSender,
+) {
+    review_requeue_current(&mut state.review);
+    if !review_activate(window, state, client, image_tx) {
+        review_top_up(window, state, tx);
+    }
+}
+
+// ─── GOON ────────────────────────────────────────────────────────────────
+
+/// Pace → rating mapping shared with the GOON persona engine
+/// (`src/routes/goon.rs`). Unknown phases and the media-free succubus phase
+/// yield no media.
+fn goon_pace_rating(phase: &str) -> Option<i64> {
+    match phase.trim().to_ascii_lowercase().as_str() {
+        "slow" => Some(2),
+        "medium" => Some(3),
+        "fast" => Some(4),
+        "cum" => Some(5),
+        _ => None,
+    }
+}
+
+fn goon_speed(rating: i64) -> f64 {
+    match rating {
+        2 => 0.8,
+        3 => 1.0,
+        4 => 1.25,
+        5 => 1.5,
+        _ => 1.0,
+    }
+}
+
+fn goon_page_query(rating: i64, cursor: Option<String>) -> LibraryQuery {
+    LibraryQuery {
+        search: None,
+        cursor,
+        media_type: None,
+        sort: "date_desc".into(),
+        rating_status: None,
+        max_rating: Some(rating),
+        source_id: None,
+        group_id: None,
+        tag: None,
+        tags: None,
+        any_tags: None,
+        exclude_tags: None,
+        creator: None,
+        min_size: None,
+        max_size: None,
+        unknown_size: None,
+    }
+}
+
+fn goon_top_up(state: &mut ViewState, tx: &WorkSender, rating: i64) {
+    if state.goon.fetching || state.goon.exhausted {
+        return;
+    }
+    state.goon.fetching = true;
+    state.goon.request = state.goon.request.wrapping_add(1);
+    let request = state.goon.request;
+    let cursor = state.goon.cursor.clone();
+    let _ = tx.send(Work::LibraryPage {
+        query: Box::new(goon_page_query(rating, cursor)),
+        request,
+        kind: PageKind::Goon,
+    });
+}
+
+/// Pure GOON selection: the next candidate matching the phase rating that is
+/// not in the recent window. Non-matching candidates rotate to the back.
+/// Returns `None` when no candidate matches. Playback stays in
+/// `goon_advance`.
+fn goon_select_next(goon: &mut GoonState, rating: i64) -> Option<MediaItem> {
+    let mut attempts = goon.candidates.len();
+    while attempts > 0 {
+        attempts -= 1;
+        let item = goon.candidates.pop_front()?;
+        if goon.recent.contains(&item.id) || item.rating != rating {
+            goon.candidates.push_back(item);
+            continue;
+        }
+        return Some(item);
+    }
+    None
+}
+
+/// Plays the next rating-matched candidate for the current GOON phase,
+/// rotating through candidates so nothing repeats back-to-back. Tops up
+/// from further library pages while they remain, so a rating match buried
+/// past the first page is still found.
+fn goon_advance(
+    window: &CuratorNativeWindow,
+    state: &mut ViewState,
+    client: &Client,
+    image_tx: &mpsc::SyncSender<(u64, MediaItem)>,
+    tx: &WorkSender,
+    rating: i64,
+) {
+    // Keep a buffer of upcoming candidates while pages remain.
+    if state.goon.candidates.len() < 8 {
+        goon_top_up(state, tx, rating);
+    }
+    while let Some(item) = goon_select_next(&mut state.goon, rating) {
+        match play_media_item(window, state, client, image_tx, &item, PlayDriver::Goon) {
+            Ok(()) => {
+                state
+                    .player
+                    .player
+                    .apply(PlayerCommand::SetSpeed(goon_speed(rating)));
+                state.goon.current = Some(item.clone());
+                state.goon.recent.push_back(item.id);
+                while state.goon.recent.len() > 10 {
+                    state.goon.recent.pop_front();
+                }
+                // Rotate: the item returns to the back for later phases.
+                state.goon.candidates.push_back(item.clone());
+                window.set_goon_status(
+                    format!("GOON media · rating {rating} · {}", item.filename).into(),
+                );
+                return;
+            }
+            Err(error) => {
+                window.set_status(format!("GOON skipped {}: {error}", item.filename).into());
+            }
+        }
+    }
+    if state.goon.exhausted && !state.goon.fetching {
+        window.set_goon_status(format!("GOON · rating {rating} · no playable media found").into());
+    } else {
+        window.set_goon_status(format!("GOON · rating {rating} · loading more media…").into());
+    }
+}
+
+/// Reacts to session snapshots: on a phase change with GOON media enabled,
+/// loads rating-matched media for the new phase. Called from the 50ms tick.
+fn goon_drive(
+    window: &CuratorNativeWindow,
+    state: &mut ViewState,
+    client: &Client,
+    image_tx: &mpsc::SyncSender<(u64, MediaItem)>,
+    tx: &WorkSender,
+    snapshot: Option<&curator::session::SessionState>,
+) {
+    use curator::session::SessionStatus;
+    if !state.goon.media_enabled {
+        return;
+    }
+    let session_id = snapshot.map(|s| s.session_id.clone());
+    if session_id != state.goon.last_session {
+        state.goon.last_session = session_id;
+        state.goon.last_phase = None;
+        state.goon.candidates.clear();
+        state.goon.current = None;
+        state.goon.cursor = None;
+        state.goon.exhausted = false;
+        state.goon.fetching = false;
+    }
+    let running = snapshot
+        .is_some_and(|s| matches!(s.status, SessionStatus::Running | SessionStatus::Paused));
+    if !running {
+        if state.player.driver == PlayDriver::Goon {
+            let status = state.player.player.apply(PlayerCommand::Stop);
+            apply_player_status(window, &mut state.player, status);
+            window.set_goon_status("GOON media stopped — session ended.".into());
+        }
+        state.goon.current = None;
+        return;
+    }
+    let phase = snapshot.map(|s| s.phase.id.clone()).unwrap_or_default();
+    if state.goon.last_phase.as_deref() == Some(phase.as_str()) {
+        return;
+    }
+    state.goon.last_phase = Some(phase.clone());
+    state.goon.candidates.clear();
+    state.goon.current = None;
+    state.goon.cursor = None;
+    state.goon.exhausted = false;
+    state.goon.fetching = false;
+    match goon_pace_rating(&phase) {
+        Some(rating) => {
+            window
+                .set_goon_status(format!("GOON · {phase} · loading rating {rating} media…").into());
+            goon_top_up(state, tx, rating);
+            let _ = (client, image_tx);
+        }
+        None => {
+            // Succubus and unknown phases deliberately have no media.
+            if state.player.driver == PlayDriver::Goon {
+                let status = state.player.player.apply(PlayerCommand::Stop);
+                apply_player_status(window, &mut state.player, status);
+            }
+            window.set_goon_status(format!("GOON · {phase} · this phase has no media.").into());
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -539,6 +1298,49 @@ fn selected_backup_index(ids: &[String], previous: Option<&str>) -> usize {
         .unwrap_or(0)
 }
 
+/// One-line-per-scope summary of the /api/remote-access payload for the
+/// native settings dialog.
+fn remote_access_summary(remote_access: &serde_json::Value) -> String {
+    if !remote_access["running"].as_bool().unwrap_or(false) {
+        return "Remote access is not running. Launch with --serve (or --background) to enable it."
+            .to_string();
+    }
+    let port = remote_access["port"].as_u64().unwrap_or(0);
+    let urls = |key: &str| {
+        remote_access[key]
+            .as_array()
+            .map(|urls| {
+                urls.iter()
+                    .filter_map(|url| url.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    let mut lines = vec![format!(
+        "Remote access is running on port {port} ({}).",
+        remote_access["access_scope"].as_str().unwrap_or("")
+    )];
+    let local = urls("local_urls");
+    if !local.is_empty() {
+        lines.push(format!("This device: {local}"));
+    }
+    let lan = urls("lan_urls");
+    if lan.is_empty() {
+        lines.push("LAN: off — enable the checkbox above for local-network access.".to_string());
+    } else {
+        lines.push(format!("LAN: {lan}"));
+    }
+    let tailscale = urls("tailscale_urls");
+    if !tailscale.is_empty() {
+        lines.push(format!("Tailnet: {tailscale}"));
+    }
+    if let Some(hostname) = remote_access["magicdns_hostname"].as_str() {
+        lines.push(format!("MagicDNS: http://{hostname}:{port}"));
+    }
+    lines.join("\n")
+}
+
 fn discovery_provider_options(providers: &serde_json::Value) -> (Vec<String>, Vec<Option<String>>) {
     let mut labels = vec!["All providers".to_owned()];
     let mut ids = vec![None];
@@ -615,6 +1417,29 @@ fn download_status_text(status: &serde_json::Value) -> String {
         .join("\n")
 }
 
+/// Compact per-source progress line for the native downloads list rows.
+fn download_source_detail(row: &serde_json::Value) -> String {
+    let completed = row["completed_count"].as_i64().unwrap_or(0);
+    let total = match row["known_total"].as_i64() {
+        Some(total) => format!(
+            "{completed} / {total} ({}%)",
+            row["percentage"].as_f64().unwrap_or(0.0).round()
+        ),
+        None => format!("{completed} completed"),
+    };
+    let current = row["current_filename"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" · {value}"))
+        .unwrap_or_default();
+    let error = row["error"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" · error: {value}"))
+        .unwrap_or_default();
+    format!("{total}{current}{error}")
+}
+
 fn apply_downloads(
     window: &CuratorNativeWindow,
     view: &Rc<RefCell<ViewState>>,
@@ -632,6 +1457,7 @@ fn apply_downloads(
                         DownloadRow {
                             label: row["name"].as_str().unwrap_or("Unnamed source").into(),
                             phase: row["phase"].as_str().unwrap_or("queued").into(),
+                            detail: download_source_detail(row).into(),
                         },
                     ))
                 })
@@ -658,13 +1484,22 @@ fn render(window: &CuratorNativeWindow, state: &ViewState) {
                 .next()
                 .is_some_and(|item| item.rating_reviewed_at.is_some()),
     );
+    window.set_queue_repeat(state.queue_repeat);
     let rows = state
         .items
         .iter()
-        .map(|item| MediaRow {
-            title: item.filename.clone().into(),
-            detail: format!("{} · {} · {} ★", item.source, item.kind, item.rating).into(),
-            selected: state.selected.contains_key(&item.id),
+        .map(|item| {
+            let (thumbnail, has_thumbnail) = match state.thumb_images.get(&item.id) {
+                Some(image) => (image.clone(), true),
+                None => (slint::Image::default(), false),
+            };
+            MediaRow {
+                title: item.filename.clone().into(),
+                detail: library_detail(item).into(),
+                selected: state.selected.contains_key(&item.id),
+                thumbnail,
+                has_thumbnail,
+            }
         })
         .collect::<Vec<_>>();
     if state.media_model.row_count() == rows.len() {
@@ -684,16 +1519,85 @@ fn render(window: &CuratorNativeWindow, state: &ViewState) {
     window.set_inspector(inspector_text(&state.selected).into());
 }
 
+/// Compact one-line summary for the library grid and table rows.
+fn library_detail(item: &MediaItem) -> String {
+    let mut parts = vec![
+        item.source.clone(),
+        item.kind.clone(),
+        format!("{} ★", item.rating),
+    ];
+    if let Some(duration) = item.duration_secs {
+        parts.push(format_duration(duration));
+    }
+    if let Some(size) = item.file_size_bytes {
+        parts.push(format_bytes(size));
+    }
+    if !item.tags.is_empty() {
+        parts.push(item.tags.join(", "));
+    }
+    parts.join(" · ")
+}
+
+fn format_duration(secs: f64) -> String {
+    let total = secs.round() as i64;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+fn format_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes.max(0) as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes.max(0), UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn inspector_text(selected: &BTreeMap<i64, MediaItem>) -> String {
     selected
         .values()
         .map(|item| {
-            format!(
-                "{}\n{}\nTags: {}",
-                item.filename,
-                item.source,
-                item.tags.join(", ")
-            )
+            let mut lines = vec![
+                item.filename.clone(),
+                format!("Source: {}", item.source),
+                format!("Type: {}", item.kind),
+                format!("Rating: {} ★", item.rating),
+            ];
+            if let Some(auto) = item.auto_rating {
+                lines.push(format!("Auto rating: {auto} ★"));
+            }
+            if let Some(human) = item.human_rating {
+                lines.push(format!("Human rating: {human} ★"));
+            }
+            if let Some(source) = item.rating_source.as_deref() {
+                lines.push(format!("Rating source: {source}"));
+            }
+            if let Some(duration) = item.duration_secs {
+                lines.push(format!("Duration: {}", format_duration(duration)));
+            }
+            if let Some(size) = item.file_size_bytes {
+                lines.push(format!("Size: {}", format_bytes(size)));
+            }
+            if let Some(added) = item.added_at.as_deref() {
+                lines.push(format!("Added: {added}"));
+            }
+            if let Some(creator) = item.creator.as_deref().filter(|c| !c.is_empty()) {
+                lines.push(format!("Creator: {creator}"));
+            }
+            lines.push(format!(
+                "Tags: {}",
+                if item.tags.is_empty() {
+                    "—".to_string()
+                } else {
+                    item.tags.join(", ")
+                }
+            ));
+            lines.join("\n")
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -722,13 +1626,15 @@ pub enum NativeExit {
 pub fn run_ui(
     runtime: &tokio::runtime::Runtime,
     client: Client,
+    background: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_ui_with_exit(runtime, client).map(|_| ())
+    run_ui_with_exit(runtime, client, background).map(|_| ())
 }
 
 pub fn run_ui_with_exit(
     runtime: &tokio::runtime::Runtime,
     client: Client,
+    background: bool,
 ) -> Result<NativeExit, Box<dyn std::error::Error>> {
     let window = CuratorNativeWindow::new()?;
     let local_host = matches!(client, Client::Local(_));
@@ -745,6 +1651,38 @@ pub fn run_ui_with_exit(
             let _ = slint::quit_event_loop();
         }
     });
+    // System tray: Show/Quit live here for the whole UI lifetime. A
+    // background launch (or the keep-running preference) hides the window
+    // instead of exiting, so downloads and remote access keep going.
+    let tray = CuratorTray::new()?;
+    {
+        let weak = window.as_weak();
+        tray.on_show_window(move || {
+            if let Some(window) = weak.upgrade() {
+                let _ = window.show();
+            }
+        });
+    }
+    tray.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+    {
+        let weak = window.as_weak();
+        window.window().on_close_requested(move || {
+            let tray_close = background
+                || weak
+                    .upgrade()
+                    .is_some_and(|window| window.get_settings_tray());
+            if tray_close {
+                slint::CloseRequestResponse::HideWindow
+            } else {
+                // No tray to fall back to: exit the event loop so the
+                // process shuts down instead of lingering invisibly.
+                let _ = slint::quit_event_loop();
+                slint::CloseRequestResponse::KeepWindowShown
+            }
+        });
+    }
     let view = Rc::new(RefCell::new(ViewState::default()));
     window.set_media(ModelRc::new(view.borrow().media_model.clone()));
     let mut preferences_writable = true;
@@ -1001,21 +1939,85 @@ pub fn run_ui_with_exit(
                         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                         curator::services::export::parse_source_file(&bytes)
                     })();
-                    let result = result.and_then(|entries| {
+                    let result = result.and_then(|parsed| {
+                        let skipped = parsed.skipped;
                         run_until_shutdown(
                             &handle,
                             &mut work_stop,
-                            worker_client.import_source_list(entries),
+                            worker_client.import_source_list(parsed.entries),
                         )
                         .ok_or("Import stopped during shutdown".to_owned())
                         .and_then(|result| result)
+                        .map(|result| (result, skipped))
                     });
-                    let message = result.map(|result| {
-                        format!(
-                            "Imported {} sources; {} duplicates skipped",
+                    let message = result.map(|(result, skipped)| {
+                        let mut parts = vec![format!(
+                            "Imported {} source{}",
                             result.sources.len(),
-                            result.duplicates.len()
-                        )
+                            if result.sources.len() == 1 { "" } else { "s" }
+                        )];
+                        if !result.duplicates.is_empty() {
+                            let names = result
+                                .duplicates
+                                .iter()
+                                .filter_map(|duplicate| {
+                                    duplicate["name"]
+                                        .as_str()
+                                        .filter(|name| !name.is_empty())
+                                        .or_else(|| duplicate["url"].as_str())
+                                })
+                                .take(5)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            parts.push(format!(
+                                "{} duplicate{} skipped (existing kept): {names}",
+                                result.duplicates.len(),
+                                if result.duplicates.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                            ));
+                        }
+                        let invalid = result.invalid.len() + skipped.len();
+                        if invalid > 0 {
+                            let mut invalid_entries = result.invalid.clone();
+                            invalid_entries.extend(skipped.iter().map(|entry| {
+                                serde_json::to_value(entry).unwrap_or(serde_json::Value::Null)
+                            }));
+                            let detail = invalid_entries
+                                .iter()
+                                .filter_map(|entry| {
+                                    let url = entry["url"]
+                                        .as_str()
+                                        .filter(|url| !url.is_empty())?;
+                                    let error = entry["error"].as_str().unwrap_or("");
+                                    Some(if error.is_empty() {
+                                        url.to_owned()
+                                    } else {
+                                        format!("{url} ({error})")
+                                    })
+                                })
+                                .take(5)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            parts.push(format!(
+                                "{invalid} invalid entr{} reported without aborting the import: {detail}",
+                                if invalid == 1 { "y" } else { "ies" },
+                            ));
+                        }
+                        if result.metadata_restored > 0 {
+                            parts.push(format!(
+                                "name/visibility/group restored on {} source{}",
+                                result.metadata_restored,
+                                if result.metadata_restored == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                            ));
+                        }
+                        parts.join("; ")
                     });
                     let _ = updates.send(Update::Imported(message));
                 }
@@ -1024,7 +2026,22 @@ pub fn run_ui_with_exit(
                 if let Some(result) =
                     run_until_shutdown(&handle, &mut work_stop, worker_client.library(*query))
                 {
-                    let _ = updates.send(Update::Page(request, result));
+                    // Thumbnails are generated on the worker thread so the UI
+                    // thread only decodes cached JPEGs. Bounded per page.
+                    let thumbs = match &result {
+                        Ok(page) => page
+                            .media
+                            .iter()
+                            .take(60)
+                            .filter_map(|item| {
+                                worker_client
+                                    .thumbnail_path(item)
+                                    .map(|path| (item.id, path))
+                            })
+                            .collect(),
+                        Err(_) => HashMap::new(),
+                    };
+                    let _ = updates.send(Update::Page(request, result, thumbs));
                 }
             }
             Work::DownloadsStatus => {
@@ -1079,6 +2096,28 @@ pub fn run_ui_with_exit(
                 });
                 if let Some(result) = result {
                     let _ = updates.send(Update::Changed(result));
+                }
+            }
+            Work::ReviewCommand(command) => {
+                let result =
+                    run_until_shutdown(&handle, &mut work_stop, worker_client.execute(command));
+                if let Some(result) = result {
+                    let _ = updates.send(Update::ReviewDone(result));
+                }
+            }
+            Work::LibraryPage {
+                query,
+                request,
+                kind,
+            } => {
+                let result =
+                    run_until_shutdown(&handle, &mut work_stop, worker_client.library(*query));
+                if let Some(result) = result {
+                    let _ = updates.send(Update::LibraryPage {
+                        kind,
+                        request,
+                        result,
+                    });
                 }
             }
         }
@@ -1200,6 +2239,89 @@ pub fn run_ui_with_exit(
     });
     let v = view.clone();
     let weak = window.as_weak();
+    window.on_select_all(move || {
+        let mut state = v.borrow_mut();
+        for item in state.items.clone() {
+            state.selected.insert(item.id, item);
+        }
+        if let Some(w) = weak.upgrade() {
+            render(&w, &state);
+        }
+    });
+    let v = view.clone();
+    let weak = window.as_weak();
+    window.on_clear_selection(move || {
+        let mut state = v.borrow_mut();
+        state.selected.clear();
+        if let Some(w) = weak.upgrade() {
+            render(&w, &state);
+        }
+    });
+    let v = view.clone();
+    let weak = window.as_weak();
+    let tx_sort = send.clone();
+    window.on_sort_library(move |column| {
+        // Header click toggles ascending/descending for the column and
+        // re-browses with the matching backend sort key.
+        let current = v.borrow().query.sort.clone();
+        let next = match column.as_str() {
+            "filename" => {
+                if current == "filename_asc" {
+                    "filename_desc"
+                } else {
+                    "filename_asc"
+                }
+            }
+            "rating" => {
+                if current == "rating_desc" {
+                    "rating_asc"
+                } else {
+                    "rating_desc"
+                }
+            }
+            "date" => {
+                if current == "date_asc" {
+                    "date_desc"
+                } else {
+                    "date_asc"
+                }
+            }
+            "size" => {
+                if current == "size_desc" {
+                    "size_asc"
+                } else {
+                    "size_desc"
+                }
+            }
+            _ => "date_desc",
+        };
+        let mut state = v.borrow_mut();
+        state.query.sort = next.to_string();
+        state.query.cursor = None;
+        state.page_cursors = vec![None];
+        state.page_scrolls.clear();
+        state.cursor = None;
+        let work = state.browse_work();
+        drop(state);
+        if let Some(w) = weak.upgrade() {
+            w.set_filter_sort(next.into());
+            w.set_busy(true);
+            w.set_library_scroll_y(0.0);
+        }
+        let _ = tx_sort.send(work);
+    });
+    let v = view.clone();
+    let tx = send.clone();
+    window.on_untag(move |tag| {
+        if !tag.trim().is_empty() {
+            let _ = tx.send(Work::Commands(vec![Command::Untag(
+                v.borrow().selected.keys().copied().collect(),
+                tag.to_string(),
+            )]));
+        }
+    });
+    let v = view.clone();
+    let weak = window.as_weak();
     let tx = send.clone();
     window.on_navigate(move |index| {
         let mut state = v.borrow_mut();
@@ -1307,8 +2429,15 @@ pub fn run_ui_with_exit(
         let _ = tx.send(Work::Commands(vec![command]));
     });
     let weak = window.as_weak();
+    let v = view.clone();
     window.on_fullscreen(move || {
-        if let Some(w) = weak.upgrade() {
+        let Some(w) = weak.upgrade() else { return };
+        let mut state = v.borrow_mut();
+        if state.player.video_active {
+            // mpv owns the pixels; fullscreen it instead of the Slint shell.
+            let status = state.player.player.apply(PlayerCommand::ToggleFullscreen);
+            apply_player_status(&w, &mut state.player, status);
+        } else {
             w.window().set_fullscreen(!w.window().is_fullscreen());
         }
     });
@@ -1403,12 +2532,49 @@ pub fn run_ui_with_exit(
             });
         }
     });
+    let weak = window.as_weak();
+    window.on_select_discovery(move |index, selected| {
+        let Some(w) = weak.upgrade() else { return };
+        if let Some(model) = w
+            .get_discovery_results()
+            .as_any()
+            .downcast_ref::<VecModel<DiscoveryRow>>()
+        {
+            if let Some(mut row) = model.row_data(index as usize) {
+                row.selected = selected;
+                model.set_row_data(index as usize, row);
+                let count = (0..model.row_count())
+                    .filter(|i| model.row_data(*i).is_some_and(|row| row.selected))
+                    .count();
+                w.set_discovery_selected_count(count as i32);
+            }
+        }
+    });
     let tx = send.clone();
     let v = view.clone();
+    let weak = window.as_weak();
     window.on_queue_discovery(move || {
-        let results = v.borrow().discovery_results.clone();
-        if !results.is_empty() {
-            let _ = tx.send(Work::Commands(vec![Command::QueueSearchResults(results)]));
+        let Some(w) = weak.upgrade() else { return };
+        let state = v.borrow();
+        let selected = w
+            .get_discovery_results()
+            .as_any()
+            .downcast_ref::<VecModel<DiscoveryRow>>()
+            .map(|model| {
+                state
+                    .discovery_results
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| model.row_data(*index).is_some_and(|row| row.selected))
+                    .map(|(_, row)| row.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        drop(state);
+        if selected.is_empty() {
+            w.set_discovery_status("Tick at least one result to queue it.".into());
+        } else {
+            let _ = tx.send(Work::Commands(vec![Command::QueueSearchResults(selected)]));
         }
     });
     let tx = send.clone();
@@ -1453,6 +2619,7 @@ pub fn run_ui_with_exit(
         window.set_settings_saving(false);
         window.set_settings_draft_theme(window.get_settings_theme());
         window.set_settings_draft_tray(window.get_settings_tray());
+        window.set_settings_draft_lan(window.get_settings_lan());
         window.set_settings_draft_layout(window.get_settings_layout());
         if window.get_local_host() {
             window.set_settings_draft_concurrent(
@@ -1496,22 +2663,6 @@ pub fn run_ui_with_exit(
                     .unwrap_or(60)
                     .to_string()
                     .into(),
-            );
-            window.set_settings_draft_slideshow_ms(
-                settings["default_slideshow_speed"]
-                    .as_f64()
-                    .unwrap_or(3000.0)
-                    .round()
-                    .to_string()
-                    .into(),
-            );
-            window.set_settings_draft_slideshow_loop(
-                settings["default_slideshow_loop"].as_bool().unwrap_or(true),
-            );
-            window.set_settings_draft_slideshow_shuffle(
-                settings["default_slideshow_shuffle"]
-                    .as_bool()
-                    .unwrap_or(false),
             );
             window.set_settings_draft_metronome(
                 settings["metronome_enabled"].as_bool().unwrap_or(false),
@@ -1570,15 +2721,13 @@ pub fn run_ui_with_exit(
                 "theme": theme.trim(),
                 "library_layout": library_layout.to_string(),
                 "keep_running_in_tray": window.get_settings_draft_tray(),
+                "lan_access_enabled": window.get_settings_draft_lan(),
                 "max_concurrent": settings_integer(&window.get_settings_draft_concurrent(), "Concurrent downloads", 1, 20)?,
                 "max_download_file_size_bytes": settings_optional_bytes(&window.get_settings_draft_max_file_bytes(), "Maximum download file size")?,
                 "max_source_storage_bytes": settings_optional_bytes(&window.get_settings_draft_max_source_bytes(), "Maximum source storage")?,
                 "minimum_free_disk_bytes": settings_optional_bytes(&window.get_settings_draft_min_free_bytes(), "Minimum free disk space")?,
                 "thumbnail_cache_max_bytes": settings_optional_bytes(&window.get_settings_draft_cache_bytes(), "Thumbnail cache limit")?,
                 "max_clip_length_secs": settings_integer(&window.get_settings_draft_max_clip_seconds(), "Maximum clip length", 5, 3600)?,
-                "default_slideshow_speed": settings_integer(&window.get_settings_draft_slideshow_ms(), "Slideshow interval", 500, 60_000)?,
-                "default_slideshow_loop": window.get_settings_draft_slideshow_loop(),
-                "default_slideshow_shuffle": window.get_settings_draft_slideshow_shuffle(),
                 "metronome_enabled": window.get_settings_draft_metronome(),
                 "export_reminder_days": settings_integer(&window.get_settings_draft_reminder_days(), "Export reminder interval", 1, 365)?,
             }))
@@ -1678,24 +2827,249 @@ pub fn run_ui_with_exit(
     });
     let weak = window.as_weak();
     let v = view.clone();
-    let image_tx = image_send.clone();
-    window.on_play(move |index| {
+    let saver = preference_saver.clone();
+    window.on_queue_move(move |from, to| {
         let mut state = v.borrow_mut();
-        if let (Some(item), Some(w)) = (state.queue.get(index as usize).cloned(), weak.upgrade()) {
-            let request = state.preview_request.wrapping_add(1);
-            let title = item.filename.clone();
-            if image_tx.try_send((request, item)).is_ok() {
-                state.preview_request = request;
-                w.set_playing(format!("Loading {title}…").into());
-            } else {
-                w.set_status("Player preview is busy; try again shortly.".into());
+        let (from, to) = (from as usize, to as usize);
+        if from < state.queue.len() && to < state.queue.len() && from != to {
+            let item = state.queue.remove(from);
+            state.queue.insert(to, item);
+            // Keep the now-playing pointer aimed at the same item.
+            if let Some(current) = state.player.queue_index {
+                state.player.queue_index = Some(if current == from {
+                    to
+                } else if from < current && current <= to {
+                    current - 1
+                } else if to <= current && current < from {
+                    current + 1
+                } else {
+                    current
+                });
             }
+        }
+        if let Some(w) = weak.upgrade() {
+            render(&w, &state);
+            if preferences_writable {
+                if let Err(error) = saver.queue(current_preferences(&w, &state)) {
+                    w.set_status(error.into());
+                }
+            }
+        }
+    });
+    let weak = window.as_weak();
+    let v = view.clone();
+    let saver = preference_saver.clone();
+    window.on_queue_shuffle(move || {
+        let mut state = v.borrow_mut();
+        // Remember the now-playing item so the pointer can follow it to its
+        // new position instead of detaching.
+        let current_id = state
+            .player
+            .queue_index
+            .and_then(|index| state.queue.get(index))
+            .map(|item| item.id);
+        // Fisher-Yates with a time-seeded PRNG; no extra dependencies.
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        let mut next_random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let len = state.queue.len();
+        for i in (1..len).rev() {
+            let j = (next_random() % (i as u64 + 1)) as usize;
+            state.queue.swap(i, j);
+        }
+        state.player.queue_index =
+            current_id.and_then(|id| state.queue.iter().position(|item| item.id == id));
+        if let Some(w) = weak.upgrade() {
+            render(&w, &state);
+            if preferences_writable {
+                if let Err(error) = saver.queue(current_preferences(&w, &state)) {
+                    w.set_status(error.into());
+                }
+            }
+        }
+    });
+    let weak = window.as_weak();
+    let v = view.clone();
+    window.on_queue_set_repeat(move |repeat| {
+        let mut state = v.borrow_mut();
+        state.queue_repeat = repeat;
+        if let Some(w) = weak.upgrade() {
+            render(&w, &state);
+        }
+    });
+    let weak = window.as_weak();
+    let v = view.clone();
+    let client_play = client.clone();
+    let tx_play = send.clone();
+    let image_play = image_send.clone();
+    window.on_play(move |index| {
+        let Some(w) = weak.upgrade() else { return };
+        let mut state = v.borrow_mut();
+        let Some(item) = state.queue.get(index as usize).cloned() else {
+            return;
+        };
+        // Manual queue play preempts feed/review/GOON driving.
+        state.feed.active = false;
+        state.feed.current = None;
+        state.feed.image_deadline = None;
+        state.review.active = false;
+        state.review.current = None;
+        state.review.countdown = None;
+        state.goon.current = None;
+        state.player.queue_index = Some(index as usize);
+        if let Err(error) = play_media_item(
+            &w,
+            &mut state,
+            &client_play,
+            &image_play,
+            &item,
+            PlayDriver::Queue,
+        ) {
+            w.set_status(format!("Could not play {}: {error}", item.filename).into());
+            let _ = tx_play.send(Work::DownloadsStatus);
+        }
+    });
+    let weak = window.as_weak();
+    let v = view.clone();
+    window.on_player_control(move |action, value| {
+        let Some(w) = weak.upgrade() else { return };
+        let mut state = v.borrow_mut();
+        let holder = &mut state.player;
+        let status = match action.as_str() {
+            "pause" => holder.player.apply(PlayerCommand::SetPaused(true)),
+            "resume" => holder.player.apply(PlayerCommand::SetPaused(false)),
+            "seek" => {
+                let value = value as f64;
+                if (value - holder.last_reported_position).abs() > 1.0 {
+                    holder.player.apply(PlayerCommand::Seek(value))
+                } else {
+                    holder.player.status()
+                }
+            }
+            "seek-relative" => {
+                let position = (holder.player.status().position_secs + value as f64).max(0.0);
+                holder.player.apply(PlayerCommand::Seek(position))
+            }
+            "volume" => {
+                let value = value as f64;
+                if (value - holder.last_reported_volume).abs() >= 0.5 {
+                    holder.player.apply(PlayerCommand::SetVolume(value))
+                } else {
+                    holder.player.status()
+                }
+            }
+            "speed" => holder.player.apply(PlayerCommand::SetSpeed(value as f64)),
+            "loop" => holder.player.apply(PlayerCommand::SetLoop(value != 0.0)),
+            _ => holder.player.status(),
+        };
+        apply_player_status(&w, holder, status);
+    });
+    let weak = window.as_weak();
+    let v = view.clone();
+    let tx = send.clone();
+    let client_feed = client.clone();
+    let image_feed = image_send.clone();
+    window.on_feed_control(move |action| {
+        let Some(w) = weak.upgrade() else { return };
+        let mut state = v.borrow_mut();
+        match action.as_str() {
+            "start" => feed_start(&w, &mut state, &tx),
+            "next" if state.feed.active => {
+                feed_advance(&w, &mut state, &client_feed, &image_feed, &tx);
+            }
+            _ => {}
+        }
+    });
+    let weak = window.as_weak();
+    let v = view.clone();
+    let tx = send.clone();
+    let client_review = client.clone();
+    let image_review = image_send.clone();
+    window.on_review_control(move |action, value| {
+        let Some(w) = weak.upgrade() else { return };
+        if !client_review.can_edit_library() {
+            w.set_review_status("Library editing is not permitted for this host.".into());
+            return;
+        }
+        let mut state = v.borrow_mut();
+        if state.review.busy && !matches!(action.as_str(), "start") {
+            return;
+        }
+        match action.as_str() {
+            "start" => review_start(&w, &mut state, &tx),
+            "skip" => {
+                if state.review.active {
+                    review_skip(&w, &mut state, &client_review, &image_review, &tx);
+                }
+            }
+            "rate" => {
+                let rating = value as i64;
+                if !(1..=5).contains(&rating) {
+                    return;
+                }
+                if let Some(item) = state.review.current.clone() {
+                    state.review.busy = true;
+                    w.set_review_status(format!("Rating {} as {rating}…", item.filename).into());
+                    let _ = tx.send(Work::ReviewCommand(Command::RateOne(item.id, rating)));
+                }
+            }
+            "approve" => {
+                if let Some(item) = state.review.current.clone() {
+                    state.review.busy = true;
+                    w.set_review_status(format!("Approving {}…", item.filename).into());
+                    let _ = tx.send(Work::ReviewCommand(Command::Approve(item.id)));
+                }
+            }
+            "undo" => {
+                if state.review.pending_undo.is_some() {
+                    return;
+                }
+                match review_begin_undo(&mut state.review) {
+                    Some((item, token)) => {
+                        state.review.busy = true;
+                        w.set_review_status(format!("Undoing review of {}…", item.filename).into());
+                        let _ = tx.send(Work::ReviewCommand(Command::UndoRating(item.id, token)));
+                    }
+                    None => {
+                        w.set_review_status("Nothing to undo.".into());
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    let weak = window.as_weak();
+    let v = view.clone();
+    window.on_goon_media(move |enabled| {
+        let mut state = v.borrow_mut();
+        state.goon.media_enabled = enabled;
+        state.goon.last_phase = None;
+        if !enabled {
+            if state.player.driver == PlayDriver::Goon {
+                let status = state.player.player.apply(PlayerCommand::Stop);
+                if let Some(w) = weak.upgrade() {
+                    apply_player_status(&w, &mut state.player, status);
+                    w.set_goon_status("GOON media off.".into());
+                }
+            }
+            state.goon.current = None;
+        } else if let Some(w) = weak.upgrade() {
+            w.set_goon_status("GOON media on — waiting for session phase.".into());
         }
     });
     let timer = slint::Timer::default();
     let weak = window.as_weak();
     let v = view.clone();
     let tx = send.clone();
+    let client_tick = client.clone();
+    let image_tick = image_send.clone();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(50),
@@ -1716,10 +3090,85 @@ pub fn run_ui_with_exit(
                         .unwrap_or_else(|error| format!("Session status unavailable: {error}"))
                         .into(),
                 );
+                let snapshot = result.as_ref().ok().and_then(|state| state.as_ref());
+                goon_drive(&w, &mut v.borrow_mut(), &client_tick, &image_tick, &tx, snapshot);
             }
             let activity = downloads_latest.lock().ok().and_then(|mut pending| pending.take());
             if let Some(result) = activity {
                 apply_downloads(&w, &v, result);
+            }
+            // Pump the native player: surface mpv events in the Slint player
+            // UI and advance the owning workflow when an item genuinely ends.
+            {
+                let statuses = v.borrow_mut().player.player.drain_events();
+                if let Some(status) = statuses.into_iter().last() {
+                    let mut state = v.borrow_mut();
+                    // Stale end-files from a replaced item never set `ended`
+                    // (the player gates them on file-loaded), so an ended
+                    // status here always belongs to the current media.
+                    if status.ended && !state.player.ended_handled {
+                        state.player.ended_handled = true;
+                        match state.player.driver {
+                            PlayDriver::Queue => {
+                                advance_queue(&w, &mut state, &client_tick, &image_tick)
+                            }
+                            PlayDriver::Feed => {
+                                let _ = feed_advance(&w, &mut state, &client_tick, &image_tick, &tx);
+                            }
+                            PlayDriver::Review => {
+                                // The review item stays put for its countdown;
+                                // the user still has to rate or skip it.
+                            }
+                            PlayDriver::Goon => {
+                                let rating = state
+                                    .goon
+                                    .last_phase
+                                    .as_deref()
+                                    .and_then(goon_pace_rating);
+                                if let Some(rating) = rating {
+                                    goon_advance(
+                                        &w,
+                                        &mut state,
+                                        &client_tick,
+                                        &image_tick,
+                                        &tx,
+                                        rating,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let holder = &mut state.player;
+                    apply_player_status(&w, holder, status);
+                }
+            }
+            // Feed dwell / max-clip and review countdown ticking.
+            {
+                let mut state = v.borrow_mut();
+                if state.feed.active && state.player.driver == PlayDriver::Feed {
+                    let dwell_elapsed = state.feed.current_is_image
+                        && state
+                            .feed
+                            .image_deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline);
+                    let clip_elapsed = !state.feed.current_is_image
+                        && state.player.video_active
+                        && state.feed.max_clip_secs > 0.0
+                        && state.player.last_reported_position >= state.feed.max_clip_secs;
+                    if dwell_elapsed || clip_elapsed {
+                        feed_advance(&w, &mut state, &client_tick, &image_tick, &tx);
+                    }
+                }
+                if state.review.active
+                    && !state.review.busy
+                    && state
+                        .review
+                        .countdown
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    state.review.countdown = None;
+                    review_skip(&w, &mut state, &client_tick, &image_tick, &tx);
+                }
             }
             while let Ok(update) = inbox.try_recv() {
                 match update {
@@ -1790,12 +3239,34 @@ pub fn run_ui_with_exit(
                         }
                     },
                     Update::Image(..) => {},
-                    Update::Page(request, result) if request == v.borrow().browse_request => {
+                    Update::Page(request, result, thumbs) if request == v.borrow().browse_request => {
                         w.set_busy(false);
                         match result {
                             Ok(page) => {
                                 let mut state = v.borrow_mut();
                                 state.items = page.media;
+                                state.thumbs = thumbs;
+                                // Keep the decoded-image cache bounded across
+                                // many page turns.
+                                if state.thumb_images.len() > 500 {
+                                    state.thumb_images.clear();
+                                }
+                                // Decode once per page on the UI thread; every
+                                // later render() reuses the decoded images.
+                                let live: std::collections::HashSet<i64> =
+                                    state.thumbs.keys().copied().collect();
+                                state.thumb_images.retain(|id, _| live.contains(id));
+                                let pending: Vec<(i64, std::path::PathBuf)> = state
+                                    .thumbs
+                                    .iter()
+                                    .filter(|(id, _)| !state.thumb_images.contains_key(id))
+                                    .map(|(id, path)| (*id, path.clone()))
+                                    .collect();
+                                for (id, path) in pending {
+                                    if let Ok(image) = slint::Image::load_from_path(&path) {
+                                        state.thumb_images.insert(id, image);
+                                    }
+                                }
                                 let refreshed_selection = state.items.iter()
                                     .filter(|item| state.selected.contains_key(&item.id))
                                     .cloned()
@@ -1838,7 +3309,23 @@ pub fn run_ui_with_exit(
                     Update::Page(..) => {}
                     Update::Manage(result) => match result {
                         Ok(snapshot) => {
-                            v.borrow_mut().settings = snapshot.settings.clone();
+                            {
+                                let mut state = v.borrow_mut();
+                                state.settings = snapshot.settings.clone();
+                                // Feed image dwell reuses the backend slideshow
+                                // interval internally; the native settings UI no
+                                // longer exposes slideshow controls.
+                                state.feed.max_clip_secs = snapshot.settings
+                                    ["max_clip_length_secs"]
+                                    .as_f64()
+                                    .unwrap_or(60.0)
+                                    .clamp(5.0, 3600.0);
+                                let dwell_ms = snapshot.settings["default_slideshow_speed"]
+                                    .as_f64()
+                                    .unwrap_or(3000.0)
+                                    .clamp(500.0, 60_000.0);
+                                state.feed.image_dwell = Duration::from_millis(dwell_ms as u64);
+                            }
                             if w.get_local_host() {
                             apply_native_palette(
                                 &w,
@@ -1848,6 +3335,14 @@ pub fn run_ui_with_exit(
                                 snapshot.settings["keep_running_in_tray"]
                                     .as_bool()
                                     .unwrap_or(true),
+                            );
+                            w.set_settings_lan(
+                                snapshot.settings["lan_access_enabled"]
+                                    .as_bool()
+                                    .unwrap_or(false),
+                            );
+                            w.set_remote_access_status(
+                                remote_access_summary(&snapshot.remote_access).into(),
                             );
                             w.set_settings_layout(
                                 snapshot.settings["library_layout"]
@@ -1872,23 +3367,34 @@ pub fn run_ui_with_exit(
                     Update::Discover(result) => match result {
                         Ok(value) => {
                             let results = value["results"].as_array().cloned().unwrap_or_default();
-                            let lines = results
+                            let rows = results
                                 .iter()
-                                .map(|row| {
-                                    format!(
-                                        "{} — {} ({})",
-                                        row["title"].as_str().unwrap_or("Untitled"),
+                                .map(|row| DiscoveryRow {
+                                    title: row["title"]
+                                        .as_str()
+                                        .unwrap_or("Untitled")
+                                        .into(),
+                                    detail: format!(
+                                        "{} · {}",
                                         row["source"].as_str().unwrap_or(""),
                                         row["result_type"].as_str().unwrap_or("")
                                     )
+                                    .into(),
+                                    selected: false,
                                 })
-                                .collect::<Vec<_>>()
-                                .join("\n");
+                                .collect::<Vec<_>>();
                             v.borrow_mut().discovery_results = results;
-                            w.set_discovery_status(if lines.is_empty() {
+                            w.set_discovery_results(ModelRc::new(VecModel::from(rows)));
+                            w.set_discovery_selected_count(0);
+                            let count = v.borrow().discovery_results.len();
+                            w.set_discovery_status(if count == 0 {
                                 "No discovery results".into()
                             } else {
-                                lines.into()
+                                format!(
+                                    "{count} result{} — tick the ones to queue",
+                                    if count == 1 { "" } else { "s" }
+                                )
+                                .into()
                             });
                         }
                         Err(error) => w.set_discovery_status(error.into()),
@@ -1928,6 +3434,236 @@ pub fn run_ui_with_exit(
                         Err(error) => w.set_status(error.into()),
                     },
                     Update::Downloads(result) => apply_downloads(&w, &v, result),
+                    Update::ReviewDone(result) => {
+                        let mut state = v.borrow_mut();
+                        state.review.busy = false;
+                        // An undo completion restores the pre-mutation snapshot
+                        // as the current item, putting the workflow back where
+                        // the rating happened.
+                        if state.review.pending_undo.is_some() {
+                            let succeeded = result.is_ok();
+                            match (review_finish_undo(&mut state.review, succeeded), result) {
+                                (Some(restored), Ok(_)) => {
+                                    state.review.current = Some(restored.clone());
+                                    match play_media_item(
+                                        &w,
+                                        &mut state,
+                                        &client_tick,
+                                        &image_tick,
+                                        &restored,
+                                        PlayDriver::Review,
+                                    ) {
+                                        Ok(()) => {
+                                            state.review.countdown = Some(
+                                                Instant::now() + Duration::from_secs(10),
+                                            );
+                                            w.set_review_status(
+                                                format!(
+                                                    "Review undone — {} is back for a decision",
+                                                    restored.filename
+                                                )
+                                                .into(),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            w.set_review_status(
+                                                format!(
+                                                    "Undone, but {} would not play: {error}",
+                                                    restored.filename
+                                                )
+                                                .into(),
+                                            );
+                                        }
+                                    }
+                                }
+                                (None, Err(error)) => {
+                                    w.set_review_status(
+                                        format!("Undo failed: {error}").into(),
+                                    );
+                                }
+                                // A succeeded undo always yields the snapshot;
+                                // a failed one pushes it back on the stack.
+                                _ => {}
+                            }
+                            // Skip the normal result handling below and move
+                            // on to the next queued update; `return` would
+                            // exit the whole tick closure instead.
+                            continue;
+                        }
+                        match result {
+                            Ok(value) => {
+                                let token = value
+                                    .get("rating_reviewed_at")
+                                    .and_then(|token| token.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                if let Some(current) = state.review.current.take() {
+                                    if !token.is_empty() {
+                                        state.review.undo_stack.push((current.clone(), token));
+                                    }
+                                    let rating = value
+                                        .get("rating")
+                                        .and_then(|rating| rating.as_i64())
+                                        .map(|rating| rating.to_string())
+                                        .unwrap_or_else(|| "reviewed".into());
+                                    w.set_review_status(
+                                        format!(
+                                            "{} marked {rating} — undo available",
+                                            current.filename
+                                        )
+                                        .into(),
+                                    );
+                                }
+                                // The rated item leaves the needs-review queue.
+                                if !review_activate(&w, &mut state, &client_tick, &image_tick) {
+                                    review_top_up(&w, &mut state, &tx);
+                                }
+                            }
+                            Err(error) => {
+                                // Restore the countdown so a failed mutation
+                                // does not strand the item.
+                                if state.review.current.is_some() {
+                                    state.review.countdown =
+                                        Some(Instant::now() + Duration::from_secs(10));
+                                }
+                                w.set_review_status(
+                                    format!("Review action failed: {error}").into(),
+                                );
+                            }
+                        }
+                    }
+                    Update::LibraryPage { kind, request, result } => {
+                        let mut state = v.borrow_mut();
+                        match kind {
+                            PageKind::Feed => {
+                                if request != state.feed.request {
+                                    // Stale page: skip it, not the whole tick.
+                                    continue;
+                                }
+                                state.feed.fetching = false;
+                                match result {
+                                    Ok(page) => {
+                                        let fresh = page
+                                            .media
+                                            .into_iter()
+                                            .filter(|item| feed_accepts(&state.feed, item))
+                                            .collect::<Vec<_>>();
+                                        state.feed.cursor = page.next_cursor.clone();
+                                        if page.next_cursor.is_none() {
+                                            state.feed.exhausted = true;
+                                        }
+                                        state.feed.candidates.extend(fresh);
+                                        if state.feed.active
+                                            && state.feed.current.is_none()
+                                        {
+                                            feed_advance(
+                                                &w,
+                                                &mut state,
+                                                &client_tick,
+                                                &image_tick,
+                                                &tx,
+                                            );
+                                        } else {
+                                            w.set_feed_status(
+                                                format!(
+                                                    "Feed · {} queued",
+                                                    state.feed.candidates.len()
+                                                )
+                                                .into(),
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        state.feed.exhausted = true;
+                                        w.set_feed_status(
+                                            format!("Feed load failed: {error}").into(),
+                                        );
+                                    }
+                                }
+                            }
+                            PageKind::Review => {
+                                if request != state.review.request {
+                                    // Stale page: skip it, not the whole tick.
+                                    continue;
+                                }
+                                state.review.fetching = false;
+                                match result {
+                                    Ok(page) => {
+                                        state.review.cursor = page.next_cursor.clone();
+                                        if page.next_cursor.is_none() {
+                                            state.review.exhausted = true;
+                                        }
+                                        state.review.queue.extend(page.media);
+                                        if state.review.active
+                                            && state.review.current.is_none()
+                                            && !review_activate(
+                                                &w,
+                                                &mut state,
+                                                &client_tick,
+                                                &image_tick,
+                                            )
+                                        {
+                                            w.set_review_status(
+                                                "Review queue is empty.".into(),
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        state.review.exhausted = true;
+                                        w.set_review_status(
+                                            format!("Review load failed: {error}").into(),
+                                        );
+                                    }
+                                }
+                            }
+                            PageKind::Goon => {
+                                if request != state.goon.request {
+                                    // Stale page: skip it, not the whole tick.
+                                    continue;
+                                }
+                                state.goon.fetching = false;
+                                match result {
+                                    Ok(page) => {
+                                        state.goon.cursor = page.next_cursor.clone();
+                                        if page.next_cursor.is_none() {
+                                            state.goon.exhausted = true;
+                                        }
+                                        let rating = state
+                                            .goon
+                                            .last_phase
+                                            .as_deref()
+                                            .and_then(goon_pace_rating);
+                                        if let Some(rating) = rating {
+                                            let mut candidates = page
+                                                .media
+                                                .into_iter()
+                                                .filter(|item| {
+                                                    item.rating == rating
+                                                        && !state.goon.recent.contains(&item.id)
+                                                })
+                                                .collect::<VecDeque<_>>();
+                                            state.goon.candidates.append(&mut candidates);
+                                            if state.goon.current.is_none() {
+                                                goon_advance(
+                                                    &w,
+                                                    &mut state,
+                                                    &client_tick,
+                                                    &image_tick,
+                                                    &tx,
+                                                    rating,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        w.set_goon_status(
+                                            format!("GOON media load failed: {error}").into(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         },
@@ -1964,7 +3700,19 @@ pub fn run_ui_with_exit(
     let _ = send.send(Work::Navigation);
     let _ = send.send(Work::ManageSnapshot);
     window.invoke_browse(false);
-    let result = window.run();
+    let result = if background {
+        // Start hidden in the tray; the remote service (if any) and the
+        // download workers keep running behind the icon.
+        window.hide()?;
+        slint::run_event_loop()
+    } else {
+        window.run()
+    };
+    // Tear down the mpv subprocess before the workers and runtime go away.
+    view.borrow_mut()
+        .player
+        .player
+        .apply(PlayerCommand::Shutdown);
     let preferences = current_preferences(&window, &view.borrow());
     timer.stop();
     let _ = session_stop.send(true);
@@ -2184,6 +3932,7 @@ mod tests {
             playback_filepath: None,
             tags: vec!["saved".into()],
             rating_reviewed_at: None,
+            ..Default::default()
         };
         state.selected.insert(selected.id, selected);
         state.items.clear();
@@ -2292,5 +4041,322 @@ mod tests {
         assert!(text.contains("1 active · 2 queued · 0 retrying"));
         assert!(text.contains("3 / 10 (30%) · clip.mp4"));
         assert!(text.contains("7 completed · total not reported"));
+    }
+
+    fn state_machine_item(
+        id: i64,
+        kind: &str,
+        rating: i64,
+        duration_secs: Option<f64>,
+    ) -> MediaItem {
+        MediaItem {
+            id,
+            filename: format!(
+                "item-{id:03}.{ext}",
+                ext = if kind == "video" { "mp4" } else { "png" }
+            ),
+            kind: kind.into(),
+            rating,
+            source: "Test source".into(),
+            filepath: format!("/library/item-{id:03}"),
+            duration_secs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn feed_selection_skips_rejected_media_and_recycles_seen_items() {
+        let mut feed = FeedState {
+            active: true,
+            max_clip_secs: 60.0,
+            ..Default::default()
+        };
+        // rating 1 is always rejected; the long video exceeds the clip cap;
+        // the seen id is rejected as a fresh candidate.
+        feed.candidates
+            .push_back(state_machine_item(1, "image", 1, None));
+        feed.candidates
+            .push_back(state_machine_item(2, "video", 3, Some(600.0)));
+        feed.candidates
+            .push_back(state_machine_item(3, "image", 3, None));
+        feed.seen_ids.insert(3);
+        feed.candidates
+            .push_back(state_machine_item(4, "video", 4, Some(30.0)));
+
+        let picked = feed_select_next(&mut feed).expect("a playable candidate exists");
+        assert_eq!(picked.id, 4, "rejected candidates must be skipped in order");
+
+        // Fresh media exhausted: recycle from the seen pool, avoiding the
+        // current item and the recent window where possible.
+        let mut feed = FeedState {
+            active: true,
+            ..Default::default()
+        };
+        let shown = state_machine_item(10, "image", 3, None);
+        let other = state_machine_item(11, "image", 4, None);
+        feed_note_seen(&mut feed, &shown);
+        feed_note_seen(&mut feed, &other);
+        feed.current = Some(shown.clone());
+        let recycled = feed_select_next(&mut feed).expect("seen pool recycles");
+        assert_eq!(recycled.id, 11, "recycle avoids the current item");
+        assert!(feed_select_next(&mut FeedState::default()).is_none());
+    }
+
+    #[test]
+    fn feed_seen_bookkeeping_bounds_the_recent_window() {
+        let mut feed = FeedState::default();
+        for id in 0..15 {
+            feed_note_seen(&mut feed, &state_machine_item(id, "image", 3, None));
+        }
+        assert_eq!(feed.seen_ids.len(), 15);
+        assert_eq!(feed.seen_pool.len(), 15);
+        assert_eq!(feed.recent.len(), 10, "recent window stays bounded");
+        // Re-showing an id does not duplicate the recycle pool.
+        feed_note_seen(&mut feed, &state_machine_item(0, "image", 3, None));
+        assert_eq!(feed.seen_pool.len(), 15);
+        assert!(feed.recent.contains(&0));
+    }
+
+    #[test]
+    fn goon_selection_matches_phase_rating_and_rotates_non_matches() {
+        let mut goon = GoonState::default();
+        goon.candidates
+            .push_back(state_machine_item(1, "video", 2, Some(10.0)));
+        goon.candidates
+            .push_back(state_machine_item(2, "video", 4, Some(10.0)));
+        goon.candidates
+            .push_back(state_machine_item(3, "video", 4, Some(10.0)));
+        goon.recent.push_back(2);
+
+        // Rating 4: item 2 is recent so item 3 is picked; non-matching and
+        // recent items rotate to the back instead of being dropped.
+        let picked = goon_select_next(&mut goon, 4).expect("rating 4 candidate exists");
+        assert_eq!(picked.id, 3);
+        assert_eq!(goon.candidates.len(), 2, "picked item leaves the deque");
+
+        // Rating 5: nothing matches.
+        let mut goon = GoonState::default();
+        goon.candidates
+            .push_back(state_machine_item(1, "video", 2, Some(10.0)));
+        assert!(goon_select_next(&mut goon, 5).is_none());
+        assert_eq!(goon.candidates.len(), 1, "non-matching items are retained");
+    }
+
+    #[test]
+    fn goon_pace_mapping_covers_phases_and_rejects_unknown_ones() {
+        assert_eq!(goon_pace_rating("slow"), Some(2));
+        assert_eq!(goon_pace_rating("medium"), Some(3));
+        assert_eq!(goon_pace_rating("fast"), Some(4));
+        assert_eq!(goon_pace_rating("cum"), Some(5));
+        assert_eq!(goon_pace_rating("edging"), None);
+        assert_eq!(goon_pace_rating(""), None);
+        assert_eq!(goon_speed(2), 0.8);
+        assert_eq!(goon_speed(5), 1.5);
+        assert_eq!(goon_speed(0), 1.0);
+    }
+
+    #[test]
+    fn goon_top_up_pages_through_the_library_cursor() {
+        let (regular, regular_rx) = mpsc::sync_channel::<Work>(8);
+        let (control, _) = mpsc::sync_channel::<Vec<Command>>(8);
+        let tx = WorkSender { regular, control };
+        let mut state = ViewState::default();
+
+        // First page carries no cursor.
+        goon_top_up(&mut state, &tx, 4);
+        assert!(state.goon.fetching);
+        let first = regular_rx.try_recv().expect("first page work sent");
+        let Work::LibraryPage {
+            query,
+            request,
+            kind,
+        } = first
+        else {
+            panic!("expected LibraryPage work");
+        };
+        assert!(matches!(kind, PageKind::Goon));
+        assert_eq!(request, 1);
+        assert!(query.cursor.is_none());
+
+        // A page arriving with a next cursor continues from it.
+        state.goon.fetching = false;
+        state.goon.cursor = Some("cursor-1".into());
+        goon_top_up(&mut state, &tx, 4);
+        let second = regular_rx.try_recv().expect("second page work sent");
+        let Work::LibraryPage { query, request, .. } = second else {
+            panic!("expected LibraryPage work");
+        };
+        assert_eq!(request, 2);
+        assert_eq!(query.cursor.as_deref(), Some("cursor-1"));
+
+        // Exhausted: no further fetches.
+        state.goon.fetching = false;
+        state.goon.exhausted = true;
+        goon_top_up(&mut state, &tx, 4);
+        assert!(
+            regular_rx.try_recv().is_err(),
+            "exhausted GOON must not fetch"
+        );
+
+        // A fetch already in flight is not duplicated.
+        state.goon.exhausted = false;
+        state.goon.fetching = true;
+        goon_top_up(&mut state, &tx, 4);
+        assert!(
+            regular_rx.try_recv().is_err(),
+            "in-flight GOON fetch must not duplicate"
+        );
+    }
+
+    #[test]
+    fn review_skip_requeues_the_current_item_for_later() {
+        let first = state_machine_item(1, "image", 0, None);
+        let second = state_machine_item(2, "image", 0, None);
+        let mut review = ReviewState {
+            active: true,
+            current: Some(first.clone()),
+            ..Default::default()
+        };
+        review.queue.push_back(first.clone());
+        review.queue.push_back(second.clone());
+
+        review_requeue_current(&mut review);
+        assert!(review.current.is_none());
+        assert_eq!(review.queue.len(), 3);
+        assert_eq!(
+            review.queue.back().unwrap().id,
+            1,
+            "skipped item goes to the back"
+        );
+
+        // Skipping with nothing current is a no-op.
+        review_requeue_current(&mut review);
+        assert_eq!(review.queue.len(), 3);
+    }
+
+    #[test]
+    fn review_undo_restores_the_pre_mutation_snapshot() {
+        let item = state_machine_item(1, "image", 5, None);
+        let mut review = ReviewState {
+            current: Some(state_machine_item(2, "image", 0, None)),
+            ..Default::default()
+        };
+        review
+            .undo_stack
+            .push((item.clone(), "token-1".to_string()));
+
+        // Begin moves the snapshot into the in-flight slot.
+        let begun = review_begin_undo(&mut review);
+        assert!(begun.is_some());
+        assert_eq!(begun.unwrap().0.id, 1);
+        assert!(review.undo_stack.is_empty());
+        assert!(review.pending_undo.is_some());
+
+        // A second begin while one is in flight starts nothing.
+        assert!(review_begin_undo(&mut review).is_none());
+
+        // Success restores the snapshot as the current item.
+        let restored = review_finish_undo(&mut review, true);
+        assert_eq!(restored.as_ref().map(|item| item.id), Some(1));
+        assert!(review.pending_undo.is_none());
+        review.current = restored;
+        assert_eq!(review.current.as_ref().unwrap().id, 1);
+    }
+
+    #[test]
+    fn review_undo_failure_returns_the_snapshot_to_the_stack() {
+        let mut review = ReviewState::default();
+        let item = state_machine_item(3, "video", 4, Some(12.0));
+        review
+            .undo_stack
+            .push((item.clone(), "token-9".to_string()));
+
+        assert!(review_begin_undo(&mut review).is_some());
+        assert!(review_finish_undo(&mut review, false).is_none());
+        assert!(review.pending_undo.is_none());
+        assert_eq!(review.undo_stack.len(), 1);
+        let (back, token) = review.undo_stack.pop().unwrap();
+        assert_eq!(back.id, 3);
+        assert_eq!(token, "token-9");
+
+        // Nothing in flight: finishing is a no-op.
+        assert!(review_finish_undo(&mut review, true).is_none());
+        // Empty stack: beginning is a no-op.
+        assert!(review_begin_undo(&mut review).is_none());
+    }
+}
+
+#[cfg(test)]
+mod download_formatter_tests {
+    use super::*;
+
+    fn status_payload() -> serde_json::Value {
+        serde_json::json!({
+            "paused": false,
+            "active_count": 1,
+            "queued_count": 2,
+            "retrying_count": 1,
+            "sources": [
+                {
+                    "id": 7,
+                    "name": "Gallery A",
+                    "phase": "downloading",
+                    "completed_count": 3,
+                    "known_total": 10,
+                    "percentage": 30.0,
+                    "current_filename": "photo.jpg",
+                    "retry_at": null,
+                    "error": null
+                },
+                {
+                    "id": 8,
+                    "name": "Gallery B",
+                    "phase": "retrying",
+                    "completed_count": 0,
+                    "known_total": null,
+                    "percentage": 0.0,
+                    "current_filename": "",
+                    "retry_at": 1758830400,
+                    "error": "connection reset"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn download_status_text_reports_progress_retry_and_error() {
+        let text = download_status_text(&status_payload());
+        assert!(text.contains("1 active · 2 queued · 1 retrying"), "{text}");
+        assert!(
+            text.contains("Gallery A — downloading · 3 / 10 (30%) · photo.jpg"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Gallery B — retrying · 0 completed · total not reported · retry at 1758830400 · error: connection reset"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn download_status_text_reports_paused_summary() {
+        let mut payload = status_payload();
+        payload["paused"] = serde_json::json!(true);
+        payload["paused_source_ids"] = serde_json::json!([7, 8]);
+        let text = download_status_text(&payload);
+        assert!(
+            text.contains("Downloads paused · 2 source(s) ready to resume"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn download_source_detail_is_compact_but_complete() {
+        let payload = status_payload();
+        let rows = payload["sources"].as_array().unwrap();
+        assert_eq!(download_source_detail(&rows[0]), "3 / 10 (30%) · photo.jpg");
+        assert_eq!(
+            download_source_detail(&rows[1]),
+            "0 completed · error: connection reset"
+        );
     }
 }

@@ -59,6 +59,9 @@ fn normalize_optional_days(value: Option<u32>) -> Result<Option<u32>, &'static s
 pub struct PatchSettingsBody {
     pub start_with_windows: Option<bool>,
     pub keep_running_in_tray: Option<bool>,
+    /// Opt-in LAN wildcard listener; takes effect on the next listener
+    /// refresh (within seconds) without a restart.
+    pub lan_access_enabled: Option<bool>,
     pub max_clip_length_secs: Option<u32>,
     pub goon_default_limit: Option<u32>,
     pub goon_log_sessions: Option<bool>,
@@ -153,22 +156,25 @@ pub async fn patch(
     if !local
         && (body.ffmpeg_bin.is_some()
             || body.start_with_windows.is_some()
-            || body.keep_running_in_tray.is_some())
+            || body.keep_running_in_tray.is_some()
+            || body.lan_access_enabled.is_some())
     {
         return Err((
             StatusCode::FORBIDDEN,
             Json(
-                json!({"error":"Executable paths and local startup/tray controls are available only on this device."}),
+                json!({"error":"Executable paths and local startup/tray/network controls are available only on this device."}),
             ),
         ));
     }
     if !host_integrations_available(&state, &peer)
-        && (body.start_with_windows.is_some() || body.keep_running_in_tray.is_some())
+        && (body.start_with_windows.is_some()
+            || body.keep_running_in_tray.is_some()
+            || body.lan_access_enabled.is_some())
     {
         return Err((
             StatusCode::FORBIDDEN,
             Json(
-                json!({"error":"Startup and tray controls are available only in the local Curator Host app."}),
+                json!({"error":"Startup, tray, and LAN controls are available only in the local Curator Host app."}),
             ),
         ));
     }
@@ -360,6 +366,7 @@ pub async fn patch(
     }
 
     let mut settings = state.settings.write().await;
+    let lan_mode_before = settings.lan_access_enabled;
 
     if let Some(v) = body.max_clip_length_secs {
         settings.max_clip_length_secs = v.clamp(5, 3600);
@@ -372,6 +379,9 @@ pub async fn patch(
     }
     if let Some(v) = body.keep_running_in_tray {
         settings.keep_running_in_tray = v;
+    }
+    if let Some(v) = body.lan_access_enabled {
+        settings.lan_access_enabled = v;
     }
     if let Some(v) = body.max_concurrent {
         let v = v.clamp(1, 20);
@@ -601,8 +611,12 @@ pub async fn patch(
         None
     };
     let response = settings_response(&state, &peer, &settings, None);
+    let lan_mode_changed = lan_mode_before != settings.lan_access_enabled;
     save_settings(&state.data_dir, &settings);
     drop(settings);
+    if lan_mode_changed {
+        crate::remote::refresh_lan_listener(&state).await;
+    }
     if let Some(limit) = thumbnail_cache_limit_to_enforce {
         let thumbs_dir = state.thumbs_dir.clone();
         match tokio::task::spawn_blocking(move || {

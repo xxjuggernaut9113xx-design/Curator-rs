@@ -65,7 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed_populated_library(&state)?;
         }
         let client = curator::native::LocalClient::new(state.clone())?;
-        let result = curator_desktop::run_ui(&runtime, curator::native::Client::Local(client));
+        let result =
+            curator_desktop::run_ui(&runtime, curator::native::Client::Local(client), false);
         runtime.block_on(curator::shutdown(&state));
         drop(state);
         drop(runtime);

@@ -1,7 +1,7 @@
 import { Button, CheckBox, ComboBox, LineEdit, ScrollView, HorizontalBox, VerticalBox, Palette, Slider } from "std-widgets.slint";
 
-export struct MediaRow { title: string, detail: string, selected: bool }
-export struct DownloadRow { label: string, phase: string }
+export struct MediaRow { title: string, detail: string, selected: bool, thumbnail: image, has-thumbnail: bool }
+export struct DownloadRow { label: string, phase: string, detail: string }
 export struct DiscoveryRow { title: string, detail: string, selected: bool }
 
 export component CuratorTray inherits SystemTrayIcon {
@@ -42,9 +42,12 @@ export component CuratorNativeWindow inherits Window {
     in-out property <bool> player-looping: false;
     callback player-control(string, float);
     callback feed-control(string);
+    in-out property <string> feed-status: "Start the feed to browse media continuously.";
     in-out property <string> review-status: "Start review to rate unreviewed media";
     callback review-control(string, int);
     in-out property <string> goon-status: "Use the existing session controls to run a rating-paced GOON session.";
+    callback goon-media(bool);
+    in-out property <bool> goon-media-enabled: false;
     in-out property <string> session-status;
     callback session-control(string);
     callback fullscreen();
@@ -66,13 +69,21 @@ export component CuratorNativeWindow inherits Window {
     callback create-group(string);
     callback move-to-group(int);
     callback select-item(int, bool);
+    callback select-all();
+    callback clear-selection();
+    callback sort-library(string);
     callback rate(int);
     callback tag(string);
+    callback untag(string);
       callback approve();
       callback undo-rating();
     callback enqueue(bool);
     callback play(int);
     callback remove-queued(int);
+    callback queue-move(int, int);
+    callback queue-shuffle();
+    callback queue-set-repeat(bool);
+    in-out property <bool> queue-repeat;
     callback add-sources(string);
     callback downloads(bool);
     callback source-download(int, bool);
@@ -102,6 +113,7 @@ export component CuratorNativeWindow inherits Window {
     in-out property <int> settings-page: 0;
     in-out property <string> settings-draft-theme: "system";
     in-out property <bool> settings-draft-tray: true;
+    in-out property <bool> settings-draft-lan: false;
     in-out property <string> settings-draft-layout: "grid";
     in-out property <string> settings-draft-concurrent: "4";
     in-out property <string> settings-draft-max-file-bytes;
@@ -109,9 +121,6 @@ export component CuratorNativeWindow inherits Window {
     in-out property <string> settings-draft-min-free-bytes;
     in-out property <string> settings-draft-cache-bytes;
     in-out property <string> settings-draft-max-clip-seconds: "60";
-    in-out property <string> settings-draft-slideshow-ms: "3000";
-    in-out property <bool> settings-draft-slideshow-loop: true;
-    in-out property <bool> settings-draft-slideshow-shuffle: false;
     in-out property <bool> settings-draft-metronome: false;
     in-out property <string> settings-draft-reminder-days: "30";
     in-out property <length> settings-general-scroll-y: 0px;
@@ -125,6 +134,7 @@ export component CuratorNativeWindow inherits Window {
     in-out property <string> manage-source-url;
     in-out property <string> manage-group-name;
     in-out property <string> manage-tag-draft;
+    in-out property <string> manage-untag-draft;
     in-out property <int> manage-target-group;
     in-out property <string> manage-discovery-query;
     in-out property <int> manage-discovery-provider;
@@ -180,6 +190,8 @@ export component CuratorNativeWindow inherits Window {
             : root.settings-theme == "system" ? ColorScheme.unknown : ColorScheme.dark;
     }
     in-out property <bool> settings-tray: true;
+    in-out property <bool> settings-lan: false;
+    in-out property <string> remote-access-status: "Remote access: not started.";
     in-out property <string> settings-layout: "grid";
     in-out property <length> library-scroll-y: 0px;
     in-out property <length> inspector-scroll-y: 0px;
@@ -247,10 +259,19 @@ export component CuratorNativeWindow inherits Window {
                     vertical-stretch: 1; horizontal-stretch: 2;
                     HorizontalBox {
                         Text { text: "Library"; font-size: 20px; horizontal-stretch: 1; }
+                        Button { text: "Select all"; enabled: !root.busy; clicked => { root.select-all(); } }
+                        Button { text: "Clear"; enabled: !root.busy && root.selected-count > 0; clicked => { root.clear-selection(); } }
                         Button { text: "Grid"; primary: root.settings-layout == "grid"; clicked => { root.settings-layout = "grid"; } }
                         Button { text: "Table"; primary: root.settings-layout == "table"; clicked => { root.settings-layout = "table"; } }
                     }
-                    if root.settings-layout == "table": Text { text: "Select     Filename                                      Source · Type · Rating"; font-weight: 700; }
+                    if root.settings-layout == "table": HorizontalBox {
+                        Text { text: "Select"; font-weight: 700; min-width: 60px; }
+                        Button { text: root.filter-sort == "filename_asc" ? "Filename ▲" : root.filter-sort == "filename_desc" ? "Filename ▼" : "Filename"; horizontal-stretch: 2; clicked => { root.sort-library("filename"); } }
+                        Button { text: "Source · Type"; enabled: false; horizontal-stretch: 1; }
+                        Button { text: root.filter-sort == "rating_desc" ? "Rating ▲" : root.filter-sort == "rating_asc" ? "Rating ▼" : "Rating"; clicked => { root.sort-library("rating"); } }
+                        Button { text: root.filter-sort == "date_desc" ? "Added ▲" : root.filter-sort == "date_asc" ? "Added ▼" : "Added"; clicked => { root.sort-library("date"); } }
+                        Button { text: root.filter-sort == "size_desc" ? "Size ▲" : root.filter-sort == "size_asc" ? "Size ▼" : "Size"; clicked => { root.sort-library("size"); } }
+                    }
                     ScrollView {
                         vertical-stretch: 1;
                         content-y <=> root.library-scroll-y;
@@ -266,12 +287,13 @@ export component CuratorNativeWindow inherits Window {
                             for entry[index] in root.media: Rectangle {
                                 row: index / root.grid-columns;
                                 col: Math.mod(index, root.grid-columns);
-                                min-width: 160px; height: 112px;
+                                min-width: 160px; height: 168px;
                                 background: entry.selected ? root.theme-selection : root.theme-elevated;
                                 border-width: 1px;
                                 border-color: entry.selected ? root.theme-accent : root.theme-line;
                                 VerticalBox {
                                     padding: 8px; spacing: 5px;
+                                    Image { source: entry.thumbnail; height: 64px; visible: entry.has-thumbnail; image-fit: contain; }
                                     CheckBox { text: "Select"; checked: entry.selected; toggled => { root.select-item(index, self.checked); } }
                                     Button { text: entry.title; clicked => { root.select-item(index, !entry.selected); } }
                                     Text { text: entry.detail; color: entry.selected ? root.theme-selection-text : root.theme-text; overflow: elide; }
@@ -291,6 +313,8 @@ export component CuratorNativeWindow inherits Window {
                     }
                     if root.can-edit-library: LineEdit { placeholder-text: "Tag for selected items"; text <=> root.manage-tag-draft; }
                     if root.can-edit-library: Button { text: "Add tag"; enabled: !root.busy; clicked => { root.tag(root.manage-tag-draft); } }
+                    if root.can-edit-library: LineEdit { placeholder-text: "Tag to remove from selected items"; text <=> root.manage-untag-draft; }
+                    if root.can-edit-library: Button { text: "Remove tag"; enabled: !root.busy; clicked => { root.untag(root.manage-untag-draft); } }
                      if root.can-edit-library: Button { text: "Approve suggestions"; enabled: !root.busy; clicked => { root.approve(); } }
                      if root.can-edit-library: Button { text: "Undo rating review"; enabled: !root.busy && root.can-undo-rating; clicked => { root.undo-rating(); } }
                     if root.local-host: Button { text: "Refresh metadata"; enabled: !root.busy; clicked => { root.refresh-selected(); } }
@@ -342,8 +366,14 @@ export component CuratorNativeWindow inherits Window {
                 horizontal-stretch: 1;
                 VerticalBox {
                     Text { text: "Player queue"; font-size: 20px; }
+                    HorizontalBox {
+                        Button { text: "Shuffle queue"; enabled: !root.busy; clicked => { root.queue-shuffle(); } }
+                        Button { text: root.queue-repeat ? "Repeat: on" : "Repeat: off"; clicked => { root.queue-set-repeat(!root.queue-repeat); } }
+                    }
                     for title[index] in root.queue: HorizontalBox {
                         Button { text: title; clicked => { root.play(index); } }
+                        Button { text: "↑"; enabled: index > 0; clicked => { root.queue-move(index, index - 1); } }
+                        Button { text: "↓"; enabled: index < root.queue.length - 1; clicked => { root.queue-move(index, index + 1); } }
                         Button { text: "Remove"; clicked => { root.remove-queued(index); } }
                     }
                 }
@@ -352,6 +382,7 @@ export component CuratorNativeWindow inherits Window {
         if root.workspace == 2: VerticalBox {
             Text { text: "Feed"; font-size: 22px; }
             Text { text: "Continuous native playback uses the current library order and never repeats the current item."; wrap: word-wrap; color: root.theme-muted; }
+            Text { text: root.feed-status; wrap: word-wrap; color: root.theme-muted; }
             Text { text: root.playing; wrap: word-wrap; }
             Text { text: root.player-status; wrap: word-wrap; }
             HorizontalBox {
@@ -379,13 +410,19 @@ export component CuratorNativeWindow inherits Window {
             Text { text: "GOON"; font-size: 22px; }
             Text { text: root.goon-status; wrap: word-wrap; color: root.theme-muted; }
             Text { text: root.session-status; wrap: word-wrap; }
+            CheckBox {
+                text: "Play rating-matched media during the session";
+                enabled: root.can-playback;
+                checked <=> root.goon-media-enabled;
+                toggled => { root.goon-media(self.checked); }
+            }
             HorizontalBox {
                 Button { text: "Start GOON session"; enabled: root.can-control-sessions; clicked => { root.session-control("Start"); } }
                 Button { text: "Pause"; enabled: root.can-control-sessions; clicked => { root.session-control("Pause"); } }
                 Button { text: "Resume"; enabled: root.can-control-sessions; clicked => { root.session-control("Resume"); } }
                 Button { text: "End"; enabled: root.can-control-sessions; clicked => { root.session-control("End"); } }
             }
-            Text { text: "GOON uses the existing Rust session timing and media ratings. Music, beat maps, speech, Cock Hero, and VR are intentionally outside this Host workflow."; wrap: word-wrap; }
+            Text { text: "GOON uses the existing Rust session timing and media ratings: slow, medium, fast, cum, and succubus phases map to their media ratings."; wrap: word-wrap; }
         }
         if root.workspace == 5: VerticalBox {
             HorizontalBox {
@@ -424,7 +461,7 @@ export component CuratorNativeWindow inherits Window {
                 content-y <=> root.manage-sources-scroll-y;
                 VerticalBox {
                     for entry[index] in root.download-sources: HorizontalBox {
-                        Text { text: entry.label + " — " + entry.phase; horizontal-stretch: 1; overflow: elide; }
+                        VerticalBox { horizontal-stretch: 1; Text { text: entry.label + " — " + entry.phase; overflow: elide; } Text { text: entry.detail; color: root.theme-muted; overflow: elide; visible: entry.detail != ""; } }
                         Button { text: "Pause"; enabled: entry.phase == "active" || entry.phase == "queued" || entry.phase == "indexing" || entry.phase == "retrying"; clicked => { root.source-download(index, true); } }
                         Button { text: "Resume"; enabled: entry.phase == "paused" || entry.phase == "failed" || entry.phase == "completed" || entry.phase == "storage_limit" || entry.phase == "low_disk"; clicked => { root.source-download(index, false); } }
                     }
@@ -491,6 +528,9 @@ export component CuratorNativeWindow inherits Window {
                         spacing: 10px; alignment: start;
                         Text { vertical-stretch: 0; text: "General"; font-size: 18px; color: root.theme-text; }
                         if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Keep Curator running in the tray"; checked <=> root.settings-draft-tray; }
+                        if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Allow access from the local network (LAN)"; checked <=> root.settings-draft-lan; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "LAN access binds the HTTP port on every local interface. Only enable it on networks you trust."; wrap: word-wrap; color: root.theme-muted; }
+                        if root.local-host: Text { vertical-stretch: 0; text: root.remote-access-status; wrap: word-wrap; color: root.theme-muted; }
                         if root.local-host: Text { vertical-stretch: 0; text: "Concurrent downloads (1–20)"; color: root.theme-text; }
                         if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-concurrent; placeholder-text: "1–20"; }
                         if !root.local-host: Text { vertical-stretch: 0; text: "Viewer device preferences are saved here. Host settings remain on the Host."; wrap: word-wrap; color: root.theme-muted; }
@@ -528,14 +568,10 @@ export component CuratorNativeWindow inherits Window {
                     VerticalBox {
                         spacing: 10px; alignment: start;
                         Text { vertical-stretch: 0; text: "Playback & GOON"; font-size: 18px; color: root.theme-text; }
-                        if root.local-host: Text { vertical-stretch: 0; text: "Slideshow interval in milliseconds (500–60000)"; wrap: word-wrap; color: root.theme-text; }
-                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-slideshow-ms; placeholder-text: "3000"; }
-                        if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Loop slideshow"; checked <=> root.settings-draft-slideshow-loop; }
-                        if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Shuffle slideshow"; checked <=> root.settings-draft-slideshow-shuffle; }
                         if root.local-host: Text { vertical-stretch: 0; text: "Maximum clip length in seconds (5–3600)"; wrap: word-wrap; color: root.theme-text; }
                         if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-max-clip-seconds; placeholder-text: "60"; }
                         if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Enable metronome"; checked <=> root.settings-draft-metronome; }
-                        Text { vertical-stretch: 0; text: "Player mode and session controls are available in the Player workspace."; wrap: word-wrap; color: root.theme-muted; }
+                        Text { vertical-stretch: 0; text: "Feed images advance automatically after the configured dwell interval. Player mode and session controls are available in the Player workspace."; wrap: word-wrap; color: root.theme-muted; }
                     }
                 }
                 if root.settings-page == 4: ScrollView {

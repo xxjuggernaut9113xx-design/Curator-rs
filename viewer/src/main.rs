@@ -286,7 +286,7 @@ async fn connect(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Runtime::new()?;
     while let Some(client) = choose_host(&runtime)? {
-        if curator_desktop::run_ui_with_exit(&runtime, client)?
+        if curator_desktop::run_ui_with_exit(&runtime, client, false)?
             != curator_desktop::NativeExit::SwitchHost
         {
             break;

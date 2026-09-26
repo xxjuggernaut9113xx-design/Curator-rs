@@ -356,6 +356,12 @@ pub async fn bulk(
             &ids,
             body.tag.as_deref(),
         )?,
+        "remove_tag" => bulk_remove_tag(
+            &state,
+            super::actor_for_peer(peer),
+            &ids,
+            body.tag.as_deref(),
+        )?,
         "set_rating" => bulk_set_rating(&state, super::actor_for_peer(peer), &ids, body.rating)?,
         "refresh_metadata" => {
             let worker_state = Arc::clone(&state);
@@ -442,6 +448,18 @@ fn bulk_add_tag(
 ) -> Result<(usize, Vec<Value>), (StatusCode, Json<Value>)> {
     let result = crate::services::media::add_tag_many(state, actor, ids, name.unwrap_or_default())
         .map_err(review_error)?;
+    Ok((result.updated, result.failed))
+}
+
+fn bulk_remove_tag(
+    state: &AppState,
+    actor: crate::services::access::Actor,
+    ids: &[i64],
+    name: Option<&str>,
+) -> Result<(usize, Vec<Value>), (StatusCode, Json<Value>)> {
+    let result =
+        crate::services::media::remove_tag_many(state, actor, ids, name.unwrap_or_default())
+            .map_err(review_error)?;
     Ok((result.updated, result.failed))
 }
 

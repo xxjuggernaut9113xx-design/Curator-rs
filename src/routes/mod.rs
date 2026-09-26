@@ -285,7 +285,10 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(peer);
-        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
 
         let mut local = axum::http::Request::builder()
             .method(Method::PATCH)
@@ -293,8 +296,13 @@ mod tests {
             .header("x-forwarded-for", "100.64.1.2")
             .body(Body::empty())
             .unwrap();
-        local.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49153))));
-        assert_ne!(app.oneshot(local).await.unwrap().status(), StatusCode::FORBIDDEN);
+        local
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49153))));
+        assert_ne!(
+            app.oneshot(local).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

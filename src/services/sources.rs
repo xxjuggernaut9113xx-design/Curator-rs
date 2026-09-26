@@ -19,6 +19,14 @@ use crate::{
 pub struct CreateSourcesResult {
     pub sources: Vec<Value>,
     pub duplicates: Vec<Value>,
+    /// Entries rejected before creation (`{"index","url","error"}`). Only the
+    /// import path fills this; single-source creation still fails fast.
+    #[serde(default)]
+    pub invalid: Vec<Value>,
+    /// Newly created sources that had exported name/included/group metadata
+    /// reapplied during import.
+    #[serde(default)]
+    pub metadata_restored: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +81,8 @@ pub fn create(
         return Ok(CreateSourcesResult {
             sources: Vec::new(),
             duplicates: Vec::new(),
+            invalid: Vec::new(),
+            metadata_restored: 0,
         });
     }
     let conn = state
@@ -149,6 +159,8 @@ pub fn create(
     Ok(CreateSourcesResult {
         sources,
         duplicates,
+        invalid: Vec::new(),
+        metadata_restored: 0,
     })
 }
 

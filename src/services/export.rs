@@ -4,7 +4,10 @@ use serde::Serialize;
 
 use crate::{db, slug::normalize_for_compare, AppState};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExportSource {
@@ -91,6 +94,13 @@ pub async fn source_list(state: &AppState) -> Result<SourceList, ExportError> {
     })
 }
 
+/// Exported metadata reapplied to a newly created source on import.
+struct ImportMeta {
+    name: Option<String>,
+    included: Option<bool>,
+    group: Option<String>,
+}
+
 pub async fn import_source_list(
     state: Arc<AppState>,
     entries: Vec<Value>,
@@ -106,26 +116,85 @@ pub async fn import_source_list(
         .maintenance
         .try_acquire_background_worker()
         .ok_or(SourceError::MaintenanceActive)?;
-    let urls = entries
-        .iter()
-        .filter_map(|entry| entry.get("url").and_then(Value::as_str).map(str::to_owned))
-        .collect::<Vec<_>>();
+    // One bad URL must not abort the batch: partition entries into valid and
+    // invalid up front and report the invalid ones in the result. Entries
+    // that repeat a URL already seen in this batch are reported as
+    // duplicates instead of being silently folded into the first one.
+    let mut urls = Vec::new();
+    let mut invalid = Vec::new();
+    let mut batch_duplicates = Vec::new();
+    let mut seen_urls = HashSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let raw = entry
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if raw.is_empty() {
+            invalid.push(serde_json::json!({
+                "index": index,
+                "url": entry.get("url"),
+                "error": "Every imported source needs a URL",
+            }));
+            continue;
+        }
+        match crate::url_guard::normalize_public_http_url(raw) {
+            Ok(normalized) => {
+                if seen_urls.insert(normalized.clone()) {
+                    urls.push(normalized);
+                } else {
+                    batch_duplicates.push(serde_json::json!({
+                        "index": index,
+                        "url": raw,
+                        "name": entry.get("name").and_then(Value::as_str),
+                        "error": "Duplicate of an earlier entry in this import",
+                    }));
+                }
+            }
+            Err(error) => invalid.push(serde_json::json!({
+                "index": index,
+                "url": raw,
+                "error": error.to_string(),
+            })),
+        }
+    }
     if urls.is_empty() {
         return Err(SourceError::InvalidInput(
             "No valid entries to import".into(),
         ));
     }
-    let result = super::sources::create(state.clone(), urls)?;
+    let mut result = super::sources::create(state.clone(), urls)?;
+    result.invalid = invalid;
+    result.duplicates.extend(batch_duplicates);
     if !result.sources.is_empty() {
-        let entries_by_url: HashMap<String, String> = entries
-            .iter()
-            .filter_map(|entry| {
-                let url = entry.get("url")?.as_str()?;
-                let group = entry.get("group")?.as_str()?;
-                (!group.is_empty()).then(|| (normalize_for_compare(url), group.to_owned()))
-            })
-            .collect();
-        if !entries_by_url.is_empty() {
+        // The first entry for a URL wins: a later duplicate's metadata must
+        // not overwrite the values from the entry that actually created the
+        // source.
+        let mut meta_by_url: HashMap<String, ImportMeta> = HashMap::new();
+        for entry in entries.iter() {
+            let Some(url) = entry.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            meta_by_url
+                .entry(normalize_for_compare(url))
+                .or_insert_with(|| ImportMeta {
+                    name: entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned),
+                    included: entry.get("included").and_then(Value::as_bool),
+                    group: entry
+                        .get("group")
+                        .and_then(Value::as_str)
+                        .filter(|group| !group.is_empty())
+                        .map(str::to_owned),
+                });
+        }
+        if meta_by_url
+            .values()
+            .any(|meta| meta.name.is_some() || meta.included.is_some() || meta.group.is_some())
+        {
             let conn = state
                 .pool
                 .get()
@@ -141,42 +210,74 @@ pub async fn import_source_list(
                     .map_err(|error| SourceError::Database(error.to_string()))?;
                 rows.filter_map(Result::ok).collect()
             };
+            let mut restored = 0;
+            let mut groups_changed = false;
             for source in &result.sources {
-                let Some(url) = source["url"].as_str() else {
+                let (Some(url), Some(id)) = (source["url"].as_str(), source["id"].as_i64()) else {
                     continue;
                 };
-                let Some(id) = source["id"].as_i64() else {
+                let Some(meta) = meta_by_url.get(&normalize_for_compare(url)) else {
                     continue;
                 };
-                let Some(group_name) = entries_by_url.get(&normalize_for_compare(url)) else {
-                    continue;
+                let group_id = match &meta.group {
+                    Some(group_name) => {
+                        let id = if let Some(id) = group_by_name.get(group_name) {
+                            *id
+                        } else {
+                            conn.execute(
+                                "INSERT INTO groups (name, added_at) VALUES (?1,?2)",
+                                rusqlite::params![group_name, db::now_iso()],
+                            )
+                            .map_err(|error| SourceError::Database(error.to_string()))?;
+                            let id = conn.last_insert_rowid();
+                            group_by_name.insert(group_name.clone(), id);
+                            id
+                        };
+                        groups_changed = true;
+                        Some(id)
+                    }
+                    None => None,
                 };
-                let group_id = if let Some(id) = group_by_name.get(group_name) {
-                    *id
-                } else {
+                if meta.name.is_some() || meta.included.is_some() || group_id.is_some() {
                     conn.execute(
-                        "INSERT INTO groups (name, added_at) VALUES (?1,?2)",
-                        rusqlite::params![group_name, db::now_iso()],
+                        "UPDATE sources SET name = COALESCE(?1, name), included = COALESCE(?2, included), group_id = COALESCE(?3, group_id) WHERE id = ?4",
+                        rusqlite::params![
+                            meta.name.clone(),
+                            meta.included.map(i64::from),
+                            group_id,
+                            id
+                        ],
                     )
                     .map_err(|error| SourceError::Database(error.to_string()))?;
-                    let id = conn.last_insert_rowid();
-                    group_by_name.insert(group_name.clone(), id);
-                    id
-                };
-                conn.execute(
-                    "UPDATE sources SET group_id=?1 WHERE id=?2",
-                    rusqlite::params![group_id, id],
-                )
-                .map_err(|error| SourceError::Database(error.to_string()))?;
+                    restored += 1;
+                }
             }
             drop(conn);
-            *state.group_tag_cache.write().await = None;
+            if groups_changed {
+                *state.group_tag_cache.write().await = None;
+            }
+            result.metadata_restored = restored;
         }
     }
     Ok(result)
 }
 
-pub fn parse_source_file(bytes: &[u8]) -> Result<Vec<Value>, String> {
+/// A source-list file with per-entry diagnostics. Malformed entries are
+/// reported, not fatal: the caller still imports every valid entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct ParsedSourceFile {
+    pub entries: Vec<Value>,
+    pub skipped: Vec<SkippedSourceEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedSourceEntry {
+    pub index: usize,
+    pub url: Option<String>,
+    pub error: String,
+}
+
+pub fn parse_source_file(bytes: &[u8]) -> Result<ParsedSourceFile, String> {
     if bytes.len() > 8 * 1024 * 1024 {
         return Err("Source-list file exceeds 8 MiB".into());
     }
@@ -188,14 +289,24 @@ pub fn parse_source_file(bytes: &[u8]) -> Result<Vec<Value>, String> {
     if entries.is_empty() || entries.len() > 10_000 {
         return Err("Source-list file must contain 1 to 10,000 sources".into());
     }
-    if entries.iter().any(|entry| {
-        entry["url"]
-            .as_str()
-            .is_none_or(|url| url.trim().is_empty())
-    }) {
-        return Err("Every imported source needs a URL".into());
+    let mut valid = Vec::with_capacity(entries.len());
+    let mut skipped = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let url = entry.get("url").and_then(Value::as_str);
+        if url.is_none_or(|url| url.trim().is_empty()) {
+            skipped.push(SkippedSourceEntry {
+                index,
+                url: url.map(str::to_owned),
+                error: "Every imported source needs a URL".to_string(),
+            });
+        } else {
+            valid.push(entry.clone());
+        }
     }
-    Ok(entries.clone())
+    Ok(ParsedSourceFile {
+        entries: valid,
+        skipped,
+    })
 }
 
 #[cfg(test)]
@@ -305,13 +416,57 @@ mod tests {
     }
 
     #[test]
-    fn native_source_file_parser_rejects_missing_urls_before_mutation() {
-        let valid = parse_source_file(
-            br#"{"sources":[{"url":"https://example.com/gallery","group":"Collection"}]}"#,
+    fn native_source_file_parser_reports_bad_entries_without_aborting() {
+        let parsed = parse_source_file(
+            br#"{"sources":[{"url":"https://example.com/gallery","group":"Collection"},{"name":"missing"},{"url":"   "}]}"#,
         )
         .unwrap();
-        assert_eq!(valid[0]["group"], "Collection");
-        assert!(parse_source_file(br#"{"sources":[{"name":"missing"}]}"#).is_err());
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0]["group"], "Collection");
+        assert_eq!(parsed.skipped.len(), 2);
+        assert_eq!(parsed.skipped[0].index, 1);
+        assert!(parsed.skipped[0].error.contains("URL"));
         assert!(parse_source_file(br#"{"sources":[]}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn import_restores_exported_metadata_and_reports_problems() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::test_support::state(root.path());
+        let entries = vec![
+            serde_json::json!({
+                "name": "My Gallery",
+                "url": "https://example.com/gallery",
+                "included": false,
+                "group": "Collection",
+            }),
+            // Duplicate of the first URL: existing record must win.
+            serde_json::json!({
+                "name": "Sneaky Rename",
+                "url": "https://example.com/gallery",
+                "included": true,
+            }),
+            // Invalid URL: reported, does not abort the batch.
+            serde_json::json!({"url": "not a url"}),
+        ];
+        let result = import_source_list(state.clone(), entries).await.unwrap();
+        assert_eq!(result.sources.len(), 1);
+        assert_eq!(result.duplicates.len(), 1);
+        assert_eq!(result.invalid.len(), 1);
+        assert_eq!(result.invalid[0]["url"], "not a url");
+        assert_eq!(result.metadata_restored, 1);
+
+        let conn = state.pool.get().unwrap();
+        let (name, included, group_name): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT s.name, s.included, g.name FROM sources s LEFT JOIN groups g ON g.id = s.group_id WHERE s.url LIKE '%example.com/gallery'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // The duplicate's rename was not applied: the first import won.
+        assert_eq!(name, "My Gallery");
+        assert_eq!(included, 0);
+        assert_eq!(group_name.as_deref(), Some("Collection"));
     }
 }

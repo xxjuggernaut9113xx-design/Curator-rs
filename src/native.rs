@@ -30,7 +30,7 @@ pub struct LibraryQuery {
     pub unknown_size: Option<bool>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct MediaItem {
     pub id: i64,
     pub filename: String,
@@ -43,6 +43,27 @@ pub struct MediaItem {
     pub tags: Vec<String>,
     #[serde(default)]
     pub rating_reviewed_at: Option<String>,
+    // Enriched metadata the library service already returns. All optional
+    // with defaults so older payloads and the remote Viewer path keep
+    // deserializing unchanged.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    #[serde(default)]
+    pub auto_rating: Option<i64>,
+    #[serde(default)]
+    pub human_rating: Option<i64>,
+    #[serde(default)]
+    pub rating_source: Option<String>,
+    #[serde(default)]
+    pub rating_reviewed: Option<bool>,
+    #[serde(default)]
+    pub file_size_bytes: Option<i64>,
+    #[serde(default)]
+    pub added_at: Option<String>,
+    #[serde(default)]
+    pub creator: Option<String>,
+    #[serde(default)]
+    pub downloaded: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -58,7 +79,14 @@ pub enum Command {
     MoveToGroup(Vec<i64>, Option<i64>),
     ImportFolder(std::path::PathBuf),
     Rate(Vec<i64>, i64),
+    /// Single-item human rating that returns the review record (including
+    /// the reviewed-at undo token). Backed by the same typed service as the
+    /// bulk rate path.
+    RateOne(i64, i64),
     Tag(Vec<i64>, String),
+    /// Remove a tag from many media items. Unknown tags and items that do
+    /// not carry the tag are reported as failed rather than aborting.
+    Untag(Vec<i64>, String),
     Approve(i64),
     UndoRating(i64, String),
     PauseDownloads,
@@ -69,7 +97,10 @@ pub enum Command {
     ResyncAll,
     DeleteMedia(Vec<i64>),
     RefreshMetadata(Vec<i64>),
-    CreateClips { media_id: i64, seconds: u32 },
+    CreateClips {
+        media_id: i64,
+        seconds: u32,
+    },
     UpdateSettings(Value),
     QueueSearchResults(Vec<Value>),
 }
@@ -737,6 +768,23 @@ impl Client {
             .map_err(|error| error.message().to_owned())
     }
 
+    /// Best-effort cached thumbnail for a library item. Generates the
+    /// thumbnail from the local file on first use and returns its cache
+    /// path; `None` for remote viewers, non-image media, or files that
+    /// cannot be decoded. Never performs network I/O.
+    pub fn thumbnail_path(&self, item: &MediaItem) -> Option<std::path::PathBuf> {
+        let Self::Local(client) = self else {
+            return None;
+        };
+        if item.kind != "image" {
+            return None;
+        }
+        let source = std::path::Path::new(&item.filepath);
+        crate::thumb_worker::get_or_create_thumb_sync(item.id, source, &client.state.thumbs_dir)
+            .ok()?;
+        Some(client.state.thumbs_dir.join(format!("{}.jpg", item.id)))
+    }
+
     pub async fn recovery(
         &self,
         request: crate::maintenance::MaintenanceRequest,
@@ -843,7 +891,9 @@ impl Client {
                     Command::CreateGroup(_)
                     | Command::MoveToGroup(_, _)
                     | Command::Rate(_, _)
+                    | Command::RateOne(_, _)
                     | Command::Tag(_, _)
+                    | Command::Untag(_, _)
                     | Command::Approve(_)
                     | Command::UndoRating(_, _)
                     | Command::CreateClips { .. } => client.permissions.library_edit,
@@ -887,9 +937,16 @@ impl Client {
                         "/api/media/bulk".into(),
                         json!({"action":"set_rating","ids":ids,"rating":rating}),
                     ),
+                    Command::RateOne(id, rating) => {
+                        (format!("/api/media/{id}/rating"), json!({"rating":rating}))
+                    }
                     Command::Tag(ids, tag) => (
                         "/api/media/bulk".into(),
                         json!({"action":"add_tag","ids":ids,"tag":tag}),
+                    ),
+                    Command::Untag(ids, tag) => (
+                        "/api/media/bulk".into(),
+                        json!({"action":"remove_tag","ids":ids,"tag":tag}),
                     ),
                     Command::Approve(id) => (format!("/api/media/{id}/rating/approve"), json!({})),
                     Command::UndoRating(id, reviewed_at) => (
@@ -1103,8 +1160,23 @@ impl LocalClient {
                     .map(|updated| json!({"action":"set_rating","updated":updated,"failed":[]}))
                     .map_err(|error| error.message().to_owned())
             }
+            Command::RateOne(id, rating) => {
+                if id <= 0 {
+                    return Err("Media ID must be positive".into());
+                }
+                crate::services::media::review(&self.state, crate::services::access::Actor::LocalOwner, id, Some(rating))
+                    .and_then(|review| {
+                        serde_json::to_value(review).map_err(|error| {
+                            crate::services::media::MediaError::Database(error.to_string())
+                        })
+                    })
+                    .map_err(|error| error.message().to_owned())
+            }
             Command::Tag(ids, tag) => crate::services::media::add_tag_many(&self.state, crate::services::access::Actor::LocalOwner, &ids, &tag)
                 .map(|result| json!({"action":"add_tag","updated":result.updated,"failed":result.failed}))
+                .map_err(|error| error.message().to_owned()),
+            Command::Untag(ids, tag) => crate::services::media::remove_tag_many(&self.state, crate::services::access::Actor::LocalOwner, &ids, &tag)
+                .map(|result| json!({"action":"remove_tag","updated":result.updated,"failed":result.failed}))
                 .map_err(|error| error.message().to_owned()),
             Command::Approve(id) => crate::services::media::review(&self.state, crate::services::access::Actor::LocalOwner, id, None)
                 .and_then(|review| {
@@ -1221,6 +1293,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_media_items_deserialize_without_enriched_metadata() {
+        let item: MediaItem = serde_json::from_value(json!({
+            "id": 7,
+            "filename": "old.jpg",
+            "type": "image",
+            "rating": 0,
+            "source": "archive",
+            "filepath": "old.jpg",
+            "playback_filepath": null,
+            "tags": [],
+            "rating_reviewed_at": null
+        }))
+        .unwrap();
+        assert_eq!(item.id, 7);
+        assert!(item.duration_secs.is_none());
+        assert!(item.auto_rating.is_none());
+        assert!(item.creator.is_none());
+    }
+
+    #[test]
     fn native_preferences_migrate_device_appearance_defaults() {
         let old = json!({"version":1,"queue":[],"width":1200,"height":800,"workspace":0,"future_option":{"enabled":true}});
         let preferences: NativePreferences = serde_json::from_value(old).unwrap();
@@ -1248,6 +1340,15 @@ mod tests {
             playback_filepath: None,
             tags: vec![],
             rating_reviewed_at: None,
+            duration_secs: None,
+            auto_rating: None,
+            human_rating: None,
+            rating_source: None,
+            rating_reviewed: None,
+            file_size_bytes: None,
+            added_at: None,
+            creator: None,
+            downloaded: None,
         });
         write_preferences(&path, &preferences).unwrap();
         preferences.queue.clear();
@@ -1336,6 +1437,28 @@ mod tests {
         assert_eq!(page.media.len(), 1);
         assert_eq!(page.media[0].rating, 4);
         assert!(page.media[0].tags.contains(&"favorite".into()));
+        // Tag removal is non-destructive to the rest of the record and
+        // reports unknown tags instead of failing the batch.
+        let untag = client
+            .execute(Command::Untag(vec![1], "favorite".into()))
+            .await
+            .unwrap();
+        assert_eq!(untag["action"], "remove_tag");
+        assert_eq!(untag["updated"], 1);
+        let page = client
+            .library(LibraryQuery {
+                search: Some("a.jpg".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!page.media[0].tags.contains(&"favorite".into()));
+        let missing = client
+            .execute(Command::Untag(vec![1], "no-such-tag".into()))
+            .await
+            .unwrap();
+        assert_eq!(missing["updated"], 0);
+        assert_eq!(missing["failed"].as_array().unwrap().len(), 1);
         let http = crate::router((*state).clone())
             .oneshot(
                 axum::http::Request::builder()

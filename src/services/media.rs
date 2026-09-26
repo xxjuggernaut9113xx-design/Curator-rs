@@ -2,6 +2,7 @@
 
 use super::access::Actor;
 use crate::{db::now_iso, provenance, AppState};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -230,6 +231,57 @@ pub fn add_tag_many(
         }
     }
     tx.commit().map_err(db_err)?;
+    Ok(BulkTagResult { updated, failed })
+}
+
+/// Remove a tag from many media items. The tag name is normalized exactly
+/// like the add path; unknown tags report every selected item as failed
+/// rather than silently doing nothing.
+pub fn remove_tag_many(
+    state: &AppState,
+    actor: Actor,
+    ids: &[i64],
+    name: &str,
+) -> Result<BulkTagResult, MediaError> {
+    let _lease = edit_lease(state, actor)?;
+    if ids.is_empty() || ids.len() > 500 || ids.iter().any(|id| *id <= 0) {
+        return Err(MediaError::InvalidSelection);
+    }
+    let name = provenance::normalize_tag(name).ok_or(MediaError::InvalidTag)?;
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let conn = state.pool.get().map_err(db_err)?;
+    let tag_id: Option<i64> = conn
+        .query_row("SELECT id FROM tags WHERE name=?1", [&name], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(db_err)?;
+    let mut updated = 0;
+    let mut failed = Vec::new();
+    match tag_id {
+        Some(tag_id) => {
+            for id in ids {
+                let removed = conn
+                    .execute(
+                        "DELETE FROM media_tags WHERE media_id=?1 AND tag_id=?2",
+                        rusqlite::params![id, tag_id],
+                    )
+                    .map_err(db_err)?;
+                if removed > 0 {
+                    updated += 1;
+                } else {
+                    failed.push(json!({"id":id,"error":"Tag not attached to this item"}));
+                }
+            }
+        }
+        None => {
+            for id in ids {
+                failed.push(json!({"id":id,"error":"Tag does not exist"}));
+            }
+        }
+    }
     Ok(BulkTagResult { updated, failed })
 }
 
@@ -477,7 +529,7 @@ mod tests {
         let peer = axum::extract::ConnectInfo(std::net::SocketAddr::from(([100, 64, 1, 2], 50000)));
         let error = crate::routes::media::set_rating(
             axum::extract::State(state.clone()),
-            Some(peer.clone()),
+            Some(peer),
             axum::extract::Path(1),
             axum::Json(crate::routes::media::RatingBody { rating: 4 }),
         )

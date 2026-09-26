@@ -102,6 +102,11 @@ pub struct Settings {
     pub start_with_windows: bool,
     #[serde(default = "default_keep_running_in_tray")]
     pub keep_running_in_tray: bool,
+    /// Opt-in LAN listener. Off by default so an accidentally shared network
+    /// never silently becomes an unauthenticated admin surface; enabling it
+    /// binds the configured port on all local interfaces.
+    #[serde(default)]
+    pub lan_access_enabled: bool,
     #[serde(default = "default_last_play_mode")]
     pub last_play_mode: String,
     #[serde(default = "default_max_concurrent")]
@@ -232,6 +237,7 @@ impl Default for Settings {
             goon_log_sessions: false,
             start_with_windows: false,
             keep_running_in_tray: default_keep_running_in_tray(),
+            lan_access_enabled: false,
             last_play_mode: default_last_play_mode(),
             max_concurrent: default_max_concurrent(),
             max_download_file_size_bytes: None,

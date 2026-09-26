@@ -59,9 +59,9 @@ fn descriptor(
 /// version, but they remain visible and their capability status is explicit.
 fn curated_providers() -> Vec<ProviderDescriptor> {
     let page = &["page", "download"];
-    // Only Balbums has a real query adapter in this build. Every other
-    // advertised extractor remains discoverable, but is explicitly direct
-    // URL-only rather than pretending a free-text search exists.
+    // Balbums, Kemono, and Coomer have real query adapters in this build.
+    // Every other advertised extractor remains discoverable, but is explicitly
+    // direct URL-only rather than pretending a free-text search exists.
     let searchable = &["page", "download", "direct_url"];
     vec![
         descriptor(
@@ -865,6 +865,216 @@ async fn search_balbums(query: &str) -> Result<Vec<SearchResult>, String> {
     Ok(parse_balbums_html(&html))
 }
 
+// ─── Kemono / Coomer query adapter ───────────────────────────────────────────
+// Both sites expose `/api/v1/posts?q=<query>&o=<offset>`, the same endpoint
+// gallery-dl's kemono extractor queries. Post records carry creator/account
+// metadata (service + user id), the post title, publish date, and file paths,
+// so free-text search maps onto result cards without inventing behavior the
+// sites do not offer. Domains migrate between suffixes, so each provider tries
+// its primary base first and falls back to the secondary one.
+
+const KEMONO_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const KEMONO_PAGE_SIZE: usize = 50;
+const KEMONO_MAX_PAGES: usize = 2;
+
+fn kemono_bases(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "kemono" => &["https://kemono.su", "https://kemono.cr"],
+        "coomer" => &["https://coomer.su", "https://coomer.party"],
+        _ => &[],
+    }
+}
+
+/// Reads a string-or-number JSON value as text. The posts API is loosely
+/// typed across site generations.
+fn kemono_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Extracts a file `path` from either an object or a JSON-encoded string.
+/// Newer API generations embed file records as strings containing JSON.
+fn kemono_file_path(value: &Value) -> Option<String> {
+    kemono_file_path_depth(value, 8)
+}
+
+/// A `file` entry is either an object with a `path` field or a JSON-encoded
+/// string of one. Cap the re-parse depth so a hostile response cannot nest
+/// JSON-encoded strings arbitrarily deep and overflow the stack; the 4 MiB
+/// response cap bounds input size but not nesting depth.
+fn kemono_file_path_depth(value: &Value, depth: u8) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    match value {
+        Value::Object(_) => value.get("path").and_then(kemono_text),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| kemono_file_path_depth(&parsed, depth - 1)),
+        _ => None,
+    }
+}
+
+fn parse_kemono_posts(base: &str, provider: &str, value: &Value) -> Vec<SearchResult> {
+    // The live endpoint wraps results as {"posts": [...], "count": N};
+    // tolerate a bare array too for older generations and tests.
+    let posts = value
+        .as_array()
+        .cloned()
+        .or_else(|| value.get("posts").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    posts
+        .iter()
+        .filter_map(|post| {
+            let id = kemono_text(post.get("id")?)?;
+            let user = kemono_text(post.get("user")?)?;
+            let service = post
+                .get("service")
+                .and_then(|service| service.as_str())
+                .unwrap_or("post")
+                .to_string();
+            let title = post
+                .get("title")
+                .and_then(|title| title.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .map(|title| title.trim().to_string())
+                .unwrap_or_else(|| "Untitled post".to_string());
+            let mut file_count = 0;
+            if post.get("file").and_then(kemono_file_path).is_some() {
+                file_count += 1;
+            }
+            if let Some(attachments) = post.get("attachments").and_then(|value| value.as_array()) {
+                file_count += attachments
+                    .iter()
+                    .filter(|attachment| kemono_file_path(attachment).is_some())
+                    .count();
+            }
+            Some(SearchResult {
+                title,
+                creator: Some(format!("{service}/{user}")),
+                thumbnail: None,
+                source: base
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .to_string(),
+                source_url: format!("{base}/{service}/user/{user}/post/{id}"),
+                provider: provider.to_string(),
+                result_type: "post".to_string(),
+                item_count: (file_count > 0).then_some(file_count as i64),
+                date: post.get("published").and_then(kemono_text),
+                // gallery-dl's kemono extractor consumes exactly these
+                // canonical post URLs.
+                gallery_dl_compatible: true,
+                gallery_dl_validated: true,
+                relevance: None,
+            })
+        })
+        .collect()
+}
+
+async fn kemono_fetch_page(
+    client: &reqwest::Client,
+    base: &str,
+    provider: &str,
+    query: &str,
+    offset: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let url = format!(
+        "{base}/api/v1/posts?q={}&o={offset}",
+        urlencoding::encode(query)
+    );
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("{provider} search request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("{provider} search failed: {error}"))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size as usize > KEMONO_MAX_RESPONSE_BYTES)
+    {
+        return Err(format!(
+            "{provider} returned an unexpectedly large search response"
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("reading {provider} results: {error}"))?;
+        if bytes.len().saturating_add(chunk.len()) > KEMONO_MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "{provider} returned an unexpectedly large search response"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("{provider} returned malformed search data"))?;
+    Ok(parse_kemono_posts(base, provider, &value))
+}
+
+async fn search_kemono_like(provider: &str, query: &str) -> Result<Vec<SearchResult>, String> {
+    let trimmed = query.trim();
+    // Verified page URLs keep the direct-URL path.
+    if let Some(result) = provider_direct_url_result(provider, trimmed) {
+        return Ok(vec![result]);
+    }
+    // URLs belong to the direct gallery-dl provider. Do not send them to an
+    // unrelated index search endpoint.
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Ok(Vec::new());
+    }
+    let bases = kemono_bases(provider);
+    if bases.is_empty() {
+        return Err("Search is not available for this provider".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("Curator/0.1 discovery")
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(crate::url_guard::public_redirect_policy())
+        .build()
+        .map_err(|error| format!("could not initialize {provider} provider: {error}"))?;
+    let mut last_error = String::new();
+    for base in bases {
+        let mut results = Vec::new();
+        let mut failed = false;
+        for page in 0..KEMONO_MAX_PAGES {
+            match kemono_fetch_page(&client, base, provider, trimmed, page * KEMONO_PAGE_SIZE).await
+            {
+                Ok(posts) => {
+                    let full_page = posts.len() >= KEMONO_PAGE_SIZE;
+                    results.extend(posts);
+                    if !full_page {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    last_error = error;
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            // Rank earlier, more relevant pages first.
+            for (index, result) in results.iter_mut().enumerate() {
+                result.relevance = Some(100i64.saturating_sub(index as i64));
+            }
+            return Ok(results);
+        }
+    }
+    Err(if last_error.is_empty() {
+        format!("{provider} search is unavailable")
+    } else {
+        last_error
+    })
+}
+
 /// A gallery/source page has a stable host and a non-media path. This is a
 /// deliberately conservative server-side guard: CDN URLs, direct image/video
 /// files, data URLs, and malformed URLs remain preview-only even if a client
@@ -1018,11 +1228,13 @@ async fn search_remote_provider(
 ) -> Result<Vec<SearchResult>, String> {
     match provider.as_str() {
         "balbums" => search_balbums(&text).await,
+        "kemono" => search_kemono_like("kemono", &text).await,
+        "coomer" => search_kemono_like("coomer", &text).await,
         // These curated adapters safely accept known page URLs right now.
         // Search/query support depends on gallery-dl version and site access;
         // return a useful per-provider error rather than attempting a fake
         // universal API request.
-        "kemono" | "erome" | "redgifs" | "deviantart" => {
+        "erome" | "redgifs" | "deviantart" => {
             if let Some(result) = provider_direct_url_result(&provider, &text) {
                 Ok(vec![result])
             } else {
@@ -1282,6 +1494,118 @@ mod tests {
                     .iter()
                     .any(|capability| capability == "search")
         }));
+    }
+
+    #[test]
+    fn kemono_posts_are_normalized_to_gallery_dl_post_results() {
+        let payload = serde_json::json!([
+            {
+                "id": "101",
+                "user": "alice42",
+                "service": "patreon",
+                "title": "Example shoot",
+                "published": "2026-05-01T12:00:00",
+                "file": { "name": "cover.jpg", "path": "/ab/cover.jpg" },
+                "attachments": [
+                    { "name": "a.mp4", "path": "/ab/a.mp4" },
+                    { "name": "broken", "path": null }
+                ]
+            },
+            {
+                "id": 202,
+                "user": 7,
+                "service": "fanbox",
+                "title": "  ",
+                "file": "{\"name\":\"x.png\",\"path\":\"/xy/x.png\"}",
+                "attachments": []
+            }
+        ]);
+        let results = parse_kemono_posts("https://kemono.su", "kemono", &payload);
+        assert_eq!(results.len(), 2);
+        let first = &results[0];
+        assert_eq!(first.title, "Example shoot");
+        assert_eq!(first.creator.as_deref(), Some("patreon/alice42"));
+        assert_eq!(first.source, "kemono.su");
+        assert_eq!(
+            first.source_url,
+            "https://kemono.su/patreon/user/alice42/post/101"
+        );
+        assert_eq!(first.result_type, "post");
+        assert_eq!(first.item_count, Some(2));
+        assert_eq!(first.date.as_deref(), Some("2026-05-01T12:00:00"));
+        assert!(first.gallery_dl_compatible);
+        assert!(first.gallery_dl_validated);
+        // Number-typed ids and JSON-encoded file records still normalize.
+        let second = &results[1];
+        assert_eq!(second.title, "Untitled post");
+        assert_eq!(second.creator.as_deref(), Some("fanbox/7"));
+        assert_eq!(second.item_count, Some(1));
+    }
+
+    #[test]
+    fn kemono_posts_parse_the_live_wrapped_response_shape() {
+        // The live /api/v1/posts endpoint wraps results in an object; a
+        // bare-array-only parser silently returned zero results.
+        let payload = serde_json::json!({
+            "count": 50000,
+            "true_count": 156492,
+            "posts": [
+                {
+                    "id": "141133143",
+                    "user": "80293853",
+                    "service": "patreon",
+                    "title": "Example post",
+                    "published": "2025-10-13T17:13:13",
+                    "file": { "name": "a.jpg", "path": "/35/a.jpg" },
+                    "attachments": [{ "name": "b.mp4", "path": "/35/b.mp4" }]
+                }
+            ]
+        });
+        let results = parse_kemono_posts("https://kemono.cr", "coomer", &payload);
+        assert_eq!(results.len(), 1);
+        let first = &results[0];
+        assert_eq!(first.title, "Example post");
+        assert_eq!(first.creator.as_deref(), Some("patreon/80293853"));
+        assert_eq!(first.source, "kemono.cr");
+        assert_eq!(
+            first.source_url,
+            "https://kemono.cr/patreon/user/80293853/post/141133143"
+        );
+        assert_eq!(first.item_count, Some(2));
+    }
+
+    #[test]
+    fn kemono_posts_without_ids_are_skipped() {
+        let payload = serde_json::json!([{ "title": "no id" }]);
+        assert!(parse_kemono_posts("https://coomer.su", "coomer", &payload).is_empty());
+        assert!(
+            parse_kemono_posts("https://coomer.su", "coomer", &serde_json::json!({})).is_empty()
+        );
+    }
+
+    #[test]
+    fn kemono_file_path_rejects_deeply_nested_json_strings() {
+        // A hostile response could nest JSON-encoded strings arbitrarily
+        // deep; the parser must bail out instead of overflowing the stack.
+        // (Each nesting level roughly doubles the fixture size through
+        // escaping, so a dozen levels is plenty to exceed the depth cap.)
+        let mut nested = serde_json::json!({ "path": "/35/a.jpg" }).to_string();
+        for _ in 0..12 {
+            nested = serde_json::to_string(&nested).unwrap();
+        }
+        assert!(kemono_file_path(&serde_json::Value::String(nested)).is_none());
+
+        // One level of JSON-encoded indirection still resolves.
+        let single = serde_json::to_string(&serde_json::json!({ "path": "/35/a.jpg" })).unwrap();
+        assert_eq!(
+            kemono_file_path(&serde_json::Value::String(single)).as_deref(),
+            Some("/35/a.jpg")
+        );
+        // Plain objects still resolve.
+        assert_eq!(
+            kemono_file_path(&serde_json::json!({ "path": "/35/a.jpg" })).as_deref(),
+            Some("/35/a.jpg")
+        );
     }
 
     #[test]
