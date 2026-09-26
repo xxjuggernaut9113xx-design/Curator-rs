@@ -38,6 +38,8 @@ struct SystemInfo {
     api_protocol: String,
     instance_id: String,
     tailnet_only: bool,
+    #[serde(default)]
+    viewer_permissions: curator::native::ViewerPermissions,
 }
 #[derive(Deserialize)]
 struct TailscaleStatus {
@@ -202,7 +204,9 @@ fn origin(ip: IpAddr, port: u16) -> String {
         IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
     }
 }
-async fn connect(endpoint: &str) -> Result<(String, String), String> {
+async fn connect(
+    endpoint: &str,
+) -> Result<(String, String, curator::native::ViewerPermissions), String> {
     let url = normalized_endpoint(endpoint)?;
     let name = url
         .host_str()
@@ -269,7 +273,7 @@ async fn connect(endpoint: &str) -> Result<(String, String), String> {
             && matches!(info.edition.as_str(), "host" | "server")
             && info.tailnet_only
         {
-            return Ok((info.instance_id, pinned));
+            return Ok((info.instance_id, pinned, info.viewer_permissions));
         }
         failures.push(format!("{address}: incompatible Curator host"));
     }
@@ -280,9 +284,22 @@ async fn connect(endpoint: &str) -> Result<(String, String), String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    while let Some(client) = choose_host(&runtime)? {
+        if curator_desktop::run_ui_with_exit(&runtime, client)?
+            != curator_desktop::NativeExit::SwitchHost
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn choose_host(
+    runtime: &tokio::runtime::Runtime,
+) -> Result<Option<curator::native::Client>, Box<dyn std::error::Error>> {
     use slint::ComponentHandle;
     use std::{cell::RefCell, rc::Rc, sync::mpsc};
-    let runtime = tokio::runtime::Runtime::new()?;
     let window = CuratorViewerWindow::new()?;
     let selected = Rc::new(RefCell::new(None));
     let (tx, rx) = mpsc::channel();
@@ -351,7 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok((name, endpoint, result)) = rx.try_recv() {
                 w.set_busy(false);
                 let outcome = (|| -> Result<(), String> {
-                    let (instance_id, pinned) = result?;
+                    let (instance_id, pinned, permissions) = result?;
                     let store = load_hosts()?;
                     if store
                         .hosts
@@ -360,7 +377,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         return Err("This saved address now identifies a different library.".into());
                     }
-                    let client = curator::native::RemoteClient::from_validated_peer(&pinned)?;
+                    let client = curator::native::RemoteClient::from_validated_peer_with_identity(
+                        &pinned,
+                        permissions,
+                        instance_id.clone(),
+                    )?;
                     if name.trim().is_empty() {
                         return Err("Give the host a name.".into());
                     }
@@ -401,10 +422,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     timer.stop();
     drop(timer);
     drop(window);
-    if let Some(client) = selected.borrow_mut().take() {
-        curator_desktop::run_ui(&runtime, curator::native::Client::Remote(client))?;
-    }
-    Ok(())
+    let selected_client = selected
+        .borrow_mut()
+        .take()
+        .map(curator::native::Client::Remote);
+    Ok(selected_client)
 }
 
 #[cfg(test)]

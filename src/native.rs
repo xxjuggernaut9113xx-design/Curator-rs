@@ -10,16 +10,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryQuery {
     pub search: Option<String>,
     pub cursor: Option<String>,
     pub media_type: Option<String>,
     pub sort: String,
     pub rating_status: Option<String>,
+    pub max_rating: Option<i64>,
     pub source_id: Option<i64>,
     pub group_id: Option<i64>,
     pub tag: Option<String>,
+    pub tags: Option<String>,
+    pub any_tags: Option<String>,
+    pub exclude_tags: Option<String>,
+    pub creator: Option<String>,
+    pub min_size: Option<i64>,
+    pub max_size: Option<i64>,
+    pub unknown_size: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -33,6 +41,8 @@ pub struct MediaItem {
     pub filepath: String,
     pub playback_filepath: Option<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub rating_reviewed_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +60,7 @@ pub enum Command {
     Rate(Vec<i64>, i64),
     Tag(Vec<i64>, String),
     Approve(i64),
+    UndoRating(i64, String),
     PauseDownloads,
     ResumeDownloads,
     PauseSource(i64),
@@ -76,6 +87,8 @@ pub struct ManageSnapshot {
     pub log_location: String,
 }
 
+pub use crate::services::backup::BackupSnapshot as RecoverySnapshot;
+
 #[derive(Clone)]
 pub struct LocalClient {
     state: Arc<AppState>,
@@ -91,12 +104,50 @@ pub enum Client {
 pub struct RemoteClient {
     origin: reqwest::Url,
     http: reqwest::Client,
+    permissions: ViewerPermissions,
+    instance_id: Option<String>,
+}
+
+enum ReconnectError {
+    Unavailable(String),
+    Changed(String),
+}
+
+/// Permissions advertised for the native Viewer by a compatible Host or
+/// Server. Missing fields from an older peer grant only read access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewerPermissions {
+    pub library_read: bool,
+    pub playback: bool,
+    pub discovery: bool,
+    pub library_edit: bool,
+    pub session_control: bool,
+}
+
+impl Default for ViewerPermissions {
+    fn default() -> Self {
+        Self {
+            library_read: true,
+            playback: true,
+            discovery: true,
+            library_edit: false,
+            session_control: false,
+        }
+    }
 }
 
 impl RemoteClient {
     /// The caller must validate this numeric origin against the connected
     /// Tailscale peer inventory and negotiate Curator's protocol first.
     pub fn from_validated_peer(origin: &str) -> Result<Self, String> {
+        Self::from_validated_peer_with_permissions(origin, ViewerPermissions::default())
+    }
+
+    pub fn from_validated_peer_with_permissions(
+        origin: &str,
+        permissions: ViewerPermissions,
+    ) -> Result<Self, String> {
         let origin = reqwest::Url::parse(origin).map_err(|e| e.to_string())?;
         let ip = origin
             .host_str()
@@ -127,7 +178,29 @@ impl RemoteClient {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self { origin, http })
+        Ok(Self {
+            origin,
+            http,
+            permissions,
+            instance_id: None,
+        })
+    }
+
+    pub fn from_validated_peer_with_identity(
+        origin: &str,
+        permissions: ViewerPermissions,
+        instance_id: String,
+    ) -> Result<Self, String> {
+        if instance_id.trim().is_empty() {
+            return Err("The Host did not provide a stable library identity".into());
+        }
+        let mut client = Self::from_validated_peer_with_permissions(origin, permissions)?;
+        client.instance_id = Some(instance_id);
+        Ok(client)
+    }
+
+    pub fn permissions(&self) -> ViewerPermissions {
+        self.permissions
     }
 
     fn url(&self, path: &str) -> Result<reqwest::Url, String> {
@@ -157,13 +230,42 @@ impl RemoteClient {
         url: reqwest::Url,
         body: Option<Value>,
     ) -> Result<Vec<u8>, String> {
-        let mut request = self.http.request(method, url);
-        if let Some(body) = body {
-            request = request
-                .header("content-type", "application/json")
-                .body(body.to_string());
-        }
-        let mut response = request.send().await.map_err(|e| e.to_string())?;
+        let retry_read = method == reqwest::Method::GET && self.instance_id.is_some();
+        let mut response = {
+            let mut attempt = 0;
+            loop {
+                let mut request = self.http.request(method.clone(), url.clone());
+                if let Some(body) = &body {
+                    request = request
+                        .header("content-type", "application/json")
+                        .body(body.to_string());
+                }
+                match request.send().await {
+                    Ok(response) => break response,
+                    Err(error) if retry_read && attempt < 2 => {
+                        loop {
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(250 * attempt))
+                                .await;
+                            match self.verify_reconnected_host().await {
+                                Ok(()) => break,
+                                Err(ReconnectError::Changed(reason)) => {
+                                    return Err(reason);
+                                }
+                                Err(ReconnectError::Unavailable(reason)) if attempt == 2 => {
+                                    return Err(format!(
+                                        "Viewer could not reconnect to the same Host: {reason}; request failed: {error}"
+                                    ));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        };
         if !response.status().is_success() {
             return Err(format!("Host returned {}", response.status()));
         }
@@ -182,6 +284,72 @@ impl RemoteClient {
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
+    }
+
+    fn validate_reconnected_info(&self, info: &Value) -> Result<(), String> {
+        let expected_id = self
+            .instance_id
+            .as_deref()
+            .ok_or("Viewer has no pinned library identity. Switch Host to reconnect safely.")?;
+        if info["instance_id"].as_str() != Some(expected_id)
+            || info["api_protocol"].as_str() != Some(crate::API_PROTOCOL)
+            || !matches!(info["edition"].as_str(), Some("host" | "server"))
+            || info["tailnet_only"].as_bool() != Some(true)
+        {
+            return Err(
+                "The saved Host identity or protocol changed. Switch Host to reconnect safely."
+                    .into(),
+            );
+        }
+        let permissions: ViewerPermissions = match info.get("viewer_permissions") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|_| "The Host returned invalid Viewer permissions".to_owned())?,
+            None => ViewerPermissions::default(),
+        };
+        if permissions != self.permissions {
+            return Err("Viewer permissions changed. Switch Host to renegotiate access.".into());
+        }
+        Ok(())
+    }
+
+    async fn verify_reconnected_host(&self) -> Result<(), ReconnectError> {
+        let url = self
+            .url("/api/system/info")
+            .map_err(ReconnectError::Changed)?;
+        let mut response = self
+            .http
+            .get(url)
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .map_err(|error| ReconnectError::Unavailable(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| ReconnectError::Unavailable(error.to_string()))?;
+        if response
+            .content_length()
+            .is_some_and(|bytes| bytes > 64 * 1024)
+        {
+            return Err(ReconnectError::Changed(
+                "Host handshake exceeds size limit".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| ReconnectError::Unavailable(error.to_string()))?
+        {
+            if bytes.len() + chunk.len() > 64 * 1024 {
+                return Err(ReconnectError::Changed(
+                    "Host handshake exceeds size limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let info: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| ReconnectError::Changed(error.to_string()))?;
+        self.validate_reconnected_info(&info)
+            .map_err(ReconnectError::Changed)
     }
 
     async fn request_method(
@@ -335,6 +503,34 @@ pub struct NativePreferences {
     pub width: u32,
     pub height: u32,
     pub workspace: i32,
+    #[serde(default = "default_native_theme")]
+    pub theme: String,
+    #[serde(default = "default_native_layout")]
+    pub layout: String,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+fn default_native_theme() -> String {
+    "system".into()
+}
+fn default_native_layout() -> String {
+    "grid".into()
+}
+
+fn write_preferences(
+    path: &std::path::Path,
+    preferences: &NativePreferences,
+) -> Result<(), String> {
+    use std::io::Write;
+    let directory = path.parent().ok_or("Invalid preferences path")?;
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut temporary, preferences).map_err(|e| e.to_string())?;
+    temporary.flush().map_err(|e| e.to_string())?;
+    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    temporary.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 impl Default for NativePreferences {
@@ -345,11 +541,42 @@ impl Default for NativePreferences {
             width: 1200,
             height: 800,
             workspace: 0,
+            theme: default_native_theme(),
+            layout: default_native_layout(),
+            extra: Default::default(),
         }
     }
 }
 
 impl Client {
+    pub fn can_edit_library(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(client) => client.permissions.library_edit,
+        }
+    }
+
+    pub fn can_control_sessions(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(client) => client.permissions.session_control,
+        }
+    }
+
+    pub fn can_playback(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(client) => client.permissions.playback,
+        }
+    }
+
+    pub fn can_discover(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(client) => client.permissions.discovery,
+        }
+    }
+
     pub async fn diagnostic_log(&self) -> Result<String, String> {
         match self {
             Self::Local(client) => {
@@ -361,21 +588,29 @@ impl Client {
     }
 
     pub async fn manage_snapshot(&self) -> Result<ManageSnapshot, String> {
+        if let Self::Remote(client) = self {
+            if !client.permissions.library_read {
+                return Err("Viewer role cannot read the library".into());
+            }
+        }
         match self {
             Self::Local(client) => Ok(ManageSnapshot {
-                settings: routes::settings::get(State(client.state.clone()), None)
-                    .await
-                    .0,
-                storage: routes::storage::dashboard(
-                    State(client.state.clone()),
-                    Query(routes::storage::StorageQuery::default()),
+                settings: crate::services::settings::read(
+                    &client.state,
+                    crate::services::settings::SettingsAudience::Local,
                 )
-                .await
-                .0,
+                .await,
+                storage: serde_json::to_value(
+                    crate::services::storage::dashboard(&client.state, None)
+                        .await
+                        .map_err(|error| error.message())?,
+                )
+                .map_err(|error| error.to_string())?,
                 stats: response(routes::misc::stats(State(client.state.clone())).await)?,
-                providers: routes::search::providers(State(client.state.clone()))
-                    .await
-                    .0,
+                providers: serde_json::to_value(
+                    crate::services::discovery::providers(&client.state).map_err(str::to_owned)?,
+                )
+                .map_err(|error| error.to_string())?,
                 remote_access: serde_json::to_value(
                     routes::remote::status(State(client.state.clone())).await.0,
                 )
@@ -396,6 +631,11 @@ impl Client {
     }
 
     pub async fn discover(&self, query: String, provider: Option<String>) -> Result<Value, String> {
+        if let Self::Remote(client) = self {
+            if !client.permissions.discovery {
+                return Err("Viewer role cannot use discovery".into());
+            }
+        }
         match self {
             Self::Local(client) => response(
                 routes::search::search(
@@ -432,11 +672,15 @@ impl Client {
             Self::Remote(client) => format!("viewer-{}", client.origin),
         };
         let key = hex::encode(Sha1::digest(key.as_bytes()));
-        Ok(dirs::config_dir()
-            .ok_or("User configuration directory is unavailable")?
-            .join("Curator")
-            .join("native-v1")
-            .join(format!("{key}.json")))
+        let directory = if let Some(override_dir) = std::env::var_os("CURATOR_NATIVE_PREFS_DIR") {
+            std::path::PathBuf::from(override_dir)
+        } else {
+            dirs::config_dir()
+                .ok_or("User configuration directory is unavailable")?
+                .join("Curator")
+                .join("native-v1")
+        };
+        Ok(directory.join(format!("{key}.json")))
     }
 
     pub fn load_preferences(&self) -> Result<NativePreferences, String> {
@@ -457,51 +701,40 @@ impl Client {
     }
 
     pub fn save_preferences(&self, preferences: &NativePreferences) -> Result<(), String> {
-        use std::io::Write;
         let path = self.preferences_path()?;
-        let directory = path.parent().ok_or("Invalid preferences path")?;
-        std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-        let mut temporary =
-            tempfile::NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
-        serde_json::to_writer(&mut temporary, preferences).map_err(|e| e.to_string())?;
-        temporary.flush().map_err(|e| e.to_string())?;
-        temporary.as_file().sync_all().map_err(|e| e.to_string())?;
-        temporary.persist(path).map_err(|e| e.to_string())?;
-        Ok(())
+        write_preferences(&path, preferences)
     }
 }
 
 impl Client {
-    pub async fn recovery_status(&self) -> Result<String, String> {
+    pub async fn export_source_list(&self) -> Result<crate::services::export::SourceList, String> {
+        let Self::Local(client) = self else {
+            return Err("Source-list export is available only on the Host device".into());
+        };
+        crate::services::export::source_list(&client.state)
+            .await
+            .map_err(|error| error.message().to_owned())
+    }
+
+    pub async fn import_source_list(
+        &self,
+        entries: Vec<Value>,
+    ) -> Result<crate::services::sources::CreateSourcesResult, String> {
+        let Self::Local(client) = self else {
+            return Err("Source-list import is available only on the Host device".into());
+        };
+        crate::services::export::import_source_list(client.state.clone(), entries)
+            .await
+            .map_err(|error| error.message().to_owned())
+    }
+
+    pub async fn recovery_status(&self) -> Result<RecoverySnapshot, String> {
         let Self::Local(client) = self else {
             return Err("Recovery is available only on the Host device".into());
         };
-        let backups = crate::maintenance::list_backups(&client.state.data_dir)
-            .map_err(|error| error.to_string())?;
-        let mut lines = vec![format!("{} saved backups", backups.len())];
-        for backup in backups {
-            lines.push(format!(
-                "{} · {} bytes · {}",
-                backup.id, backup.size_bytes, backup.created_at
-            ));
-        }
-        for job in client.state.maintenance.jobs().await {
-            lines.push(format!(
-                "{:?}: {:?} · {}{}{}",
-                job.kind,
-                job.phase,
-                job.message,
-                job.error
-                    .map(|error| format!(" · {error}"))
-                    .unwrap_or_default(),
-                if job.restart_required {
-                    " · Restart required"
-                } else {
-                    ""
-                }
-            ));
-        }
-        Ok(lines.join("\n"))
+        crate::services::backup::snapshot(&client.state)
+            .await
+            .map_err(|error| error.message().to_owned())
     }
 
     pub async fn recovery(
@@ -511,16 +744,20 @@ impl Client {
         let Self::Local(client) = self else {
             return Err("Recovery is available only on the Host device".into());
         };
-        if client.state.shutdown.is_cancelled() {
-            return Err("Curator is shutting down".into());
-        }
         // Maintenance owns admission and waits for ordinary workers itself.
         // Holding a background-worker lease here would deadlock that wait.
-        response(routes::admin::start_job(State(client.state.clone()), None, Json(request)).await)?;
+        crate::services::jobs::start(client.state.clone(), request)
+            .await
+            .map_err(|error| error.message().to_owned())?;
         Ok(())
     }
 
     pub async fn session(&self) -> Result<Option<crate::session::SessionState>, String> {
+        if let Self::Remote(client) = self {
+            if !client.permissions.playback {
+                return Err("Viewer role cannot view sessions".into());
+            }
+        }
         match self {
             Self::Local(client) => Ok(crate::services::session::current(&client.state)),
             Self::Remote(client) => {
@@ -530,6 +767,11 @@ impl Client {
         }
     }
     pub async fn navigation(&self) -> Result<Vec<NavigationItem>, String> {
+        if let Self::Remote(client) = self {
+            if !client.permissions.library_read {
+                return Err("Viewer role cannot read the library".into());
+            }
+        }
         let (sources, groups, summary) = match self {
             Self::Local(client) => (
                 response(routes::sources::list(State(client.state.clone())).await)?,
@@ -547,6 +789,11 @@ impl Client {
         Ok(navigation_items(&sources, &groups, &summary))
     }
     pub async fn library(&self, query: LibraryQuery) -> Result<MediaPage, String> {
+        if let Self::Remote(client) = self {
+            if !client.permissions.library_read {
+                return Err("Viewer role cannot read the library".into());
+            }
+        }
         match self {
             Self::Local(client) => client.library(query).await,
             Self::Remote(client) => {
@@ -574,6 +821,11 @@ impl Client {
     }
 
     pub async fn downloads(&self) -> Result<Value, String> {
+        if let Self::Remote(client) = self {
+            if !client.permissions.library_read {
+                return Err("Viewer role cannot read activity".into());
+            }
+        }
         match self {
             Self::Local(client) => client.downloads().await,
             Self::Remote(client) => client.request("/api/downloads/status", None).await,
@@ -584,6 +836,35 @@ impl Client {
         match self {
             Self::Local(client) => client.execute(command).await,
             Self::Remote(client) => {
+                let permitted = match &command {
+                    Command::StartSession | Command::Session(_) => {
+                        client.permissions.session_control
+                    }
+                    Command::CreateGroup(_)
+                    | Command::MoveToGroup(_, _)
+                    | Command::Rate(_, _)
+                    | Command::Tag(_, _)
+                    | Command::Approve(_)
+                    | Command::UndoRating(_, _)
+                    | Command::CreateClips { .. } => client.permissions.library_edit,
+                    // These operations enqueue or control downloads on the
+                    // remote library. The read-only Viewer role never gains
+                    // them from a local UI affordance.
+                    Command::AddSources(_)
+                    | Command::ResyncAll
+                    | Command::QueueSearchResults(_) => false,
+                    Command::PauseDownloads
+                    | Command::ResumeDownloads
+                    | Command::PauseSource(_)
+                    | Command::ResumeSource(_)
+                    | Command::ImportFolder(_)
+                    | Command::DeleteMedia(_)
+                    | Command::RefreshMetadata(_)
+                    | Command::UpdateSettings(_) => true,
+                };
+                if !permitted {
+                    return Err("Viewer role does not permit this operation".into());
+                }
                 let (path, body) = match command {
                     Command::StartSession => (
                         "/api/session/start".into(),
@@ -611,8 +892,13 @@ impl Client {
                         json!({"action":"add_tag","ids":ids,"tag":tag}),
                     ),
                     Command::Approve(id) => (format!("/api/media/{id}/rating/approve"), json!({})),
-                    Command::PauseDownloads => ("/api/downloads/pause".into(), json!({})),
-                    Command::ResumeDownloads => ("/api/downloads/resume".into(), json!({})),
+                    Command::UndoRating(id, reviewed_at) => (
+                        format!("/api/media/{id}/rating/undo"),
+                        json!({"rating_reviewed_at":reviewed_at}),
+                    ),
+                    Command::PauseDownloads | Command::ResumeDownloads => {
+                        return Err("Download control is available only on Host".into())
+                    }
                     Command::PauseSource(_) | Command::ResumeSource(_) => {
                         return Err("Per-source download control is available only on Host".into())
                     }
@@ -628,10 +914,11 @@ impl Client {
                         format!("/api/media/{media_id}/clips"),
                         json!({"seconds":seconds}),
                     ),
-                    Command::UpdateSettings(value) => {
-                        return client
-                            .request_method(reqwest::Method::PATCH, "/api/settings", Some(value))
-                            .await;
+                    Command::UpdateSettings(_) => {
+                        return Err(
+                            "Host settings cannot be changed by Viewer without a negotiated role"
+                                .into(),
+                        );
                     }
                     Command::QueueSearchResults(results) => {
                         ("/api/search/download".into(), json!({"results":results}))
@@ -643,6 +930,11 @@ impl Client {
     }
 
     pub async fn image(&self, item: &MediaItem) -> Result<NativeImage, String> {
+        if let Self::Remote(client) = self {
+            if !client.permissions.playback {
+                return Err("Viewer role cannot stream media".into());
+            }
+        }
         let mut reader = match self {
             Self::Local(client) => {
                 let path = client.media_path(item.id)?;
@@ -682,6 +974,27 @@ impl Client {
             pixels: image.into_raw(),
         })
     }
+
+    /// Return the native player's only supported source for an item. Local
+    /// Hosts hand mpv an absolute managed-library path; Viewers hand it the
+    /// already validated, pinned Host stream URL. Neither route accepts a
+    /// caller supplied arbitrary media URL.
+    pub fn playback_source(&self, item: &MediaItem) -> Result<String, String> {
+        if item.id <= 0 {
+            return Err("Media ID must be positive".into());
+        }
+        match self {
+            Self::Local(client) => client
+                .media_path(item.id)
+                .map(|path| path.to_string_lossy().into_owned()),
+            Self::Remote(client) => {
+                if !client.permissions.playback {
+                    return Err("Viewer role cannot stream media".into());
+                }
+                Ok(client.media_stream_url(item.id)?.to_string())
+            }
+        }
+    }
 }
 
 fn response(
@@ -709,7 +1022,12 @@ impl LocalClient {
         let mut value = serde_json::to_value(query).map_err(|e| e.to_string())?;
         value["limit"] = json!(100);
         let query = serde_json::from_value(value).map_err(|e| e.to_string())?;
-        let page = response(routes::media::list(State(self.state.clone()), Query(query)).await)?;
+        let page = serde_json::to_value(
+            crate::services::library::list(&self.state, query)
+                .await
+                .map_err(|error| error.message().to_owned())?,
+        )
+        .map_err(|e| e.to_string())?;
         serde_json::from_value(page).map_err(|e| e.to_string())
     }
 
@@ -761,6 +1079,7 @@ impl LocalClient {
             Command::MoveToGroup(ids, group_id) => response(
                 routes::media::bulk(
                     state,
+                    None,
                     Json(routes::media::BulkMediaBody {
                         ids,
                         action: "move".into(),
@@ -776,33 +1095,33 @@ impl LocalClient {
                     .map(|id| json!({"id":id}))
                     .map_err(|e| e.to_string())
             }
-            Command::Rate(ids, rating) => response(
-                routes::media::bulk(
-                    state,
-                    Json(routes::media::BulkMediaBody {
-                        ids,
-                        action: "set_rating".into(),
-                        rating: Some(rating),
-                        tag: None,
-                        group_id: None,
-                    }),
-                )
-                .await,
-            ),
-            Command::Tag(ids, tag) => response(
-                routes::media::bulk(
-                    state,
-                    Json(routes::media::BulkMediaBody {
-                        ids,
-                        action: "add_tag".into(),
-                        rating: None,
-                        tag: Some(tag),
-                        group_id: None,
-                    }),
-                )
-                .await,
-            ),
-            Command::Approve(id) => response(routes::media::approve_rating(state, Path(id)).await),
+            Command::Rate(ids, rating) => {
+                if ids.is_empty() || ids.len() > 500 || ids.iter().any(|id| *id <= 0) {
+                    return Err("Select between one and 500 valid media items".into());
+                }
+                crate::services::media::rate_many(&self.state, crate::services::access::Actor::LocalOwner, &ids, rating)
+                    .map(|updated| json!({"action":"set_rating","updated":updated,"failed":[]}))
+                    .map_err(|error| error.message().to_owned())
+            }
+            Command::Tag(ids, tag) => crate::services::media::add_tag_many(&self.state, crate::services::access::Actor::LocalOwner, &ids, &tag)
+                .map(|result| json!({"action":"add_tag","updated":result.updated,"failed":result.failed}))
+                .map_err(|error| error.message().to_owned()),
+            Command::Approve(id) => crate::services::media::review(&self.state, crate::services::access::Actor::LocalOwner, id, None)
+                .and_then(|review| {
+                    serde_json::to_value(review).map_err(|error| {
+                        crate::services::media::MediaError::Database(error.to_string())
+                    })
+                })
+                .map_err(|error| error.message().to_owned()),
+            Command::UndoRating(id, reviewed_at) => {
+                crate::services::media::undo_review(&self.state, crate::services::access::Actor::LocalOwner, id, &reviewed_at)
+                    .and_then(|review| {
+                        serde_json::to_value(review).map_err(|error| {
+                            crate::services::media::MediaError::Database(error.to_string())
+                        })
+                    })
+                    .map_err(|error| error.message().to_owned())
+            }
             Command::PauseDownloads => {
                 let result = crate::services::downloads::pause(&self.state).await;
                 if let Some(error) = result["error"].as_str() {
@@ -832,20 +1151,20 @@ impl LocalClient {
                 }
                 Ok(result)
             }
-            Command::AddSources(text) => response(
-                routes::sources::add(
-                    state,
-                    Json(routes::sources::AddSourcesBody {
-                        urls: Vec::new(),
-                        text: Some(text),
-                    }),
-                )
-                .await,
-            ),
+            Command::AddSources(text) => {
+                let candidates = crate::slug::split_bulk_input(&text);
+                if candidates.is_empty() {
+                    return Err("No valid URLs provided".into());
+                }
+                let result = crate::services::sources::create(self.state.clone(), candidates)
+                    .map_err(|error| error.message().to_owned())?;
+                serde_json::to_value(result).map_err(|error| error.to_string())
+            }
             Command::ResyncAll => Ok(routes::sources::resync_all(state).await.0),
             Command::DeleteMedia(ids) => response(
                 routes::media::bulk(
                     state,
+                    None,
                     Json(routes::media::BulkMediaBody {
                         ids,
                         action: "delete".into(),
@@ -859,6 +1178,7 @@ impl LocalClient {
             Command::RefreshMetadata(ids) => response(
                 routes::media::bulk(
                     state,
+                    None,
                     Json(routes::media::BulkMediaBody {
                         ids,
                         action: "refresh_metadata".into(),
@@ -899,6 +1219,45 @@ impl LocalClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_preferences_migrate_device_appearance_defaults() {
+        let old = json!({"version":1,"queue":[],"width":1200,"height":800,"workspace":0,"future_option":{"enabled":true}});
+        let preferences: NativePreferences = serde_json::from_value(old).unwrap();
+        assert_eq!(preferences.theme, "system");
+        assert_eq!(preferences.layout, "grid");
+        assert_eq!(preferences.extra["future_option"]["enabled"], true);
+        assert_eq!(
+            serde_json::to_value(preferences).unwrap()["future_option"]["enabled"],
+            true
+        );
+    }
+
+    #[test]
+    fn queue_preferences_replace_a_complete_json_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native-v1").join("prefs.json");
+        let mut preferences = NativePreferences::default();
+        preferences.queue.push(MediaItem {
+            id: 1,
+            filename: "first.jpg".into(),
+            kind: "image".into(),
+            rating: 0,
+            source: "test".into(),
+            filepath: "first.jpg".into(),
+            playback_filepath: None,
+            tags: vec![],
+            rating_reviewed_at: None,
+        });
+        write_preferences(&path, &preferences).unwrap();
+        preferences.queue.clear();
+        preferences.extra.insert("future_option".into(), json!(42));
+        write_preferences(&path, &preferences).unwrap();
+        let saved: NativePreferences =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(saved.queue.is_empty());
+        assert_eq!(saved.extra["future_option"], 42);
+    }
 
     #[tokio::test]
     async fn native_navigation_counts_match_server_library_summary() {
@@ -992,6 +1351,15 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["media"][0]["rating"], 4);
+        let reviewed_at = page.media[0].rating_reviewed_at.clone().unwrap();
+        client
+            .execute(Command::UndoRating(1, reviewed_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.library(LibraryQuery::default()).await.unwrap().media[0].rating,
+            0
+        );
         assert!(client
             .library(LibraryQuery {
                 search: Some("%".into()),
@@ -1102,10 +1470,50 @@ mod tests {
         assert!(RemoteClient::from_validated_peer("http://[fd7a:115c:a1e0::2]:42168").is_ok());
     }
 
+    #[test]
+    fn viewer_reconnect_requires_the_same_library_and_permissions() {
+        let client = RemoteClient::from_validated_peer_with_identity(
+            "http://100.64.1.2:42168",
+            ViewerPermissions::default(),
+            "library-a".into(),
+        )
+        .unwrap();
+        let info = serde_json::json!({
+            "instance_id": "library-a",
+            "api_protocol": crate::API_PROTOCOL,
+            "edition": "host",
+            "tailnet_only": true,
+            "viewer_permissions": ViewerPermissions::default(),
+        });
+        assert!(client.validate_reconnected_info(&info).is_ok());
+        let mut replaced = info.clone();
+        replaced["instance_id"] = serde_json::json!("library-b");
+        assert!(client.validate_reconnected_info(&replaced).is_err());
+        let mut elevated = info;
+        elevated["viewer_permissions"]["library_edit"] = serde_json::json!(true);
+        assert!(client.validate_reconnected_info(&elevated).is_err());
+        assert!(RemoteClient::from_validated_peer_with_identity(
+            "http://100.64.1.2:42168",
+            ViewerPermissions::default(),
+            String::new(),
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn remote_recovery_is_rejected_without_network_access() {
         let client =
             Client::Remote(RemoteClient::from_validated_peer("http://100.64.1.2:42168").unwrap());
+        assert!(client
+            .export_source_list()
+            .await
+            .unwrap_err()
+            .contains("only on the Host"));
+        assert!(client
+            .import_source_list(Vec::new())
+            .await
+            .unwrap_err()
+            .contains("only on the Host"));
         assert!(client
             .recovery_status()
             .await
@@ -1142,10 +1550,79 @@ mod tests {
             .unwrap_err()
             .contains("only on Host"));
         assert!(client
+            .execute(Command::PauseDownloads)
+            .await
+            .unwrap_err()
+            .contains("only on Host"));
+        assert!(client
+            .execute(Command::ResumeDownloads)
+            .await
+            .unwrap_err()
+            .contains("only on Host"));
+        assert!(client
+            .execute(Command::UpdateSettings(json!({"theme":"ember"})))
+            .await
+            .unwrap_err()
+            .contains("negotiated role"));
+        assert!(client
             .execute(Command::ResumeSource(1))
             .await
             .unwrap_err()
             .contains("only on Host"));
+    }
+
+    #[tokio::test]
+    async fn negotiated_read_only_viewer_denies_mutations_before_network() {
+        let permissions: ViewerPermissions = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(permissions, ViewerPermissions::default());
+        let client = Client::Remote(
+            RemoteClient::from_validated_peer_with_permissions(
+                "http://100.64.1.2:42168",
+                permissions,
+            )
+            .unwrap(),
+        );
+        assert!(!client.can_edit_library());
+        assert!(!client.can_control_sessions());
+        assert!(client.can_playback());
+        for command in [
+            Command::Rate(vec![1], 4),
+            Command::Tag(vec![1], "test".into()),
+            Command::Approve(1),
+            Command::UndoRating(1, "token".into()),
+            Command::CreateGroup("test".into()),
+            Command::AddSources("https://example.com".into()),
+            Command::StartSession,
+        ] {
+            assert!(client
+                .execute(command)
+                .await
+                .unwrap_err()
+                .contains("Viewer role"));
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiated_library_read_denial_covers_snapshots() {
+        let permissions = ViewerPermissions {
+            library_read: false,
+            playback: false,
+            discovery: false,
+            ..ViewerPermissions::default()
+        };
+        let client = Client::Remote(
+            RemoteClient::from_validated_peer_with_permissions(
+                "http://100.64.1.2:42168",
+                permissions,
+            )
+            .unwrap(),
+        );
+        assert!(client.library(LibraryQuery::default()).await.is_err());
+        assert!(client.navigation().await.is_err());
+        assert!(client.manage_snapshot().await.is_err());
+        assert!(client.downloads().await.is_err());
+        assert!(client.session().await.is_err());
+        assert!(client.discover("test".into(), None).await.is_err());
     }
 
     #[tokio::test]
@@ -1163,6 +1640,23 @@ mod tests {
             .unwrap();
         let settings = routes::settings::get(State(state.clone()), None).await.0;
         assert_eq!(settings["theme"], "midnight");
+    }
+
+    #[tokio::test]
+    async fn recovery_snapshot_exposes_selectable_backup_records_only_to_host() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_support::state(root.path());
+        let backup_dir = state.data_dir.join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("curator-snapshot.zip"), b"fixture").unwrap();
+        let host = Client::Local(LocalClient::new((*state).clone()).unwrap());
+        let snapshot = host.recovery_status().await.unwrap();
+        assert_eq!(snapshot.backups.len(), 1);
+        assert_eq!(snapshot.backups[0].id, "curator-snapshot.zip");
+        assert_eq!(snapshot.backups[0].size_bytes, 7);
+        let viewer =
+            Client::Remote(RemoteClient::from_validated_peer("http://100.64.1.2:42168").unwrap());
+        assert!(viewer.recovery_status().await.is_err());
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ pub mod thumb;
 
 use crate::AppState;
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -30,7 +30,17 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
+
+pub(crate) fn actor_for_peer(
+    peer: Option<ConnectInfo<SocketAddr>>,
+) -> crate::services::access::Actor {
+    if peer.is_some_and(|peer| !peer.0.ip().is_loopback()) {
+        crate::services::access::Actor::RemoteViewer
+    } else {
+        crate::services::access::Actor::LocalOwner
+    }
+}
 
 /// Maintenance owns the library exclusively while it takes a safety backup
 /// and applies a recovery transaction.  Individual download routes also
@@ -47,6 +57,20 @@ async fn maintenance_write_guard(
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
     if mutating_method {
+        // The capability handshake currently grants Viewer read access only.
+        // The TCP peer supplied by axum::serve is the authority here; a
+        // caller-provided header cannot turn a Tailnet request into Host.
+        if request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|peer| !peer.0.ip().is_loopback())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"Viewer role does not permit this operation"})),
+            )
+                .into_response();
+        }
         // Hold a lease for the full request, rather than merely checking the
         // flag once.  This closes the otherwise unavoidable race where a
         // maintenance job starts between a middleware check and a handler's
@@ -232,6 +256,46 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn tailnet_viewer_cannot_mutate_through_any_http_method() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::test_support::state(root.path());
+        let app = build_router(state);
+        let peer = ConnectInfo(SocketAddr::from(([100, 64, 1, 2], 49152)));
+        for (method, path) in [
+            (Method::POST, "/api/sources"),
+            (Method::PUT, "/api/media/1/rating"),
+            (Method::PATCH, "/api/settings"),
+            (Method::DELETE, "/api/groups/1"),
+            (Method::POST, "/api/session/start"),
+            (Method::POST, "/api/admin/jobs"),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(peer);
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let mut request = axum::http::Request::builder()
+            .uri("/api/system/info")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(peer);
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+
+        let mut local = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri("/api/settings")
+            .header("x-forwarded-for", "100.64.1.2")
+            .body(Body::empty())
+            .unwrap();
+        local.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49153))));
+        assert_ne!(app.oneshot(local).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
 
     #[tokio::test]
     async fn maintenance_mode_rejects_all_normal_mutations() {

@@ -165,7 +165,7 @@ pub struct AppState {
     /// rows that still have NULL file_size_bytes.
     pub size_backfill: Arc<RwLock<media_files::SizeBackfillProgress>>,
     /// Version-aware discovery registry built once at process startup.
-    pub search_registry: Arc<routes::search::ProviderRegistry>,
+    pub search_registry: Arc<services::discovery::ProviderRegistry>,
     pub data_dir: PathBuf,
     pub library_dir: PathBuf,
     pub archives_dir: PathBuf,

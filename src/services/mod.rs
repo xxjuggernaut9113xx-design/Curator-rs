@@ -1,4 +1,13 @@
+pub mod access;
+pub mod backup;
 pub mod diagnostics;
+pub mod discovery;
 pub mod downloads;
+pub mod export;
+pub mod jobs;
+pub mod library;
 pub mod media;
 pub mod session;
+pub mod settings;
+pub mod sources;
+pub mod storage;

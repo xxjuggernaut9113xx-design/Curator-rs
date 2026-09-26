@@ -37,27 +37,13 @@ pub async fn dashboard(
     State(state): State<Arc<AppState>>,
     Query(query): Query<StorageQuery>,
 ) -> Json<Value> {
-    let settings = state.settings.read().await.clone();
-    let pool = state.pool.clone();
-    let data_dir = state.data_dir.clone();
-    let library_dir = state.library_dir.clone();
-    let archives_dir = state.archives_dir.clone();
-    let thumbs_dir = state.thumbs_dir.clone();
-    let sort = query.sort.unwrap_or_else(|| "usage_desc".into());
-    let snapshot = tokio::task::spawn_blocking(move || {
-        crate::storage::dashboard_snapshot(
-            &pool,
-            &data_dir,
-            &library_dir,
-            &archives_dir,
-            &thumbs_dir,
-            &settings,
-            &sort,
-        )
-    })
-    .await
-    .unwrap_or_else(|_| json!({"error":"Storage accounting did not complete."}));
-    Json(snapshot)
+    Json(
+        match crate::services::storage::dashboard(&state, query.sort).await {
+            Ok(snapshot) => serde_json::to_value(snapshot)
+                .unwrap_or_else(|_| json!({"error":"Storage accounting did not complete."})),
+            Err(error) => json!({"error":error.message()}),
+        },
+    )
 }
 
 pub async fn permit_one_sync(

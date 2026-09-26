@@ -447,7 +447,7 @@ impl SessionService {
         if slot.as_ref().is_some_and(|engine| {
             matches!(
                 engine.state.status,
-                SessionStatus::Running | SessionStatus::Paused
+                SessionStatus::Ready | SessionStatus::Running | SessionStatus::Paused
             )
         }) {
             return Err("A session is already active".into());
@@ -500,13 +500,10 @@ impl SessionService {
     /// Starts a session through the shared application boundary and advances
     /// it immediately. Adapters never need to manufacture timestamps.
     pub fn start_running(&self, config: GameConfig) -> Result<SessionUpdate, String> {
-        if self.snapshot().is_some_and(|state| {
-            matches!(state.status, SessionStatus::Running | SessionStatus::Paused)
-        }) {
-            return Err("A session is already active".into());
-        }
-        self.stop_runner();
         self.start(config)?;
+        // Do not cancel the current runner until the new session has been
+        // admitted. A racing rejected Start must leave that runner alive.
+        self.stop_runner();
         let update = self.dispatch(SessionCommand::Start {
             monotonic_ms: self.now(),
         })?;
@@ -1292,6 +1289,14 @@ mod tests {
         cfg.phases.truncate(1);
         let started = service.start_running(cfg).unwrap();
         assert_eq!(started.state.status, SessionStatus::Running);
+        assert_eq!(
+            service.start_running(config(72)).unwrap_err(),
+            "A session is already active"
+        );
+        assert_eq!(
+            service.snapshot().unwrap().session_id,
+            started.state.session_id
+        );
 
         // Advance the scheduler and injected process clock together. No wall
         // clock sleep or client Tick participates in session completion.
@@ -1315,5 +1320,16 @@ mod tests {
         .await
         .expect("the authoritative runner should complete from injected time");
         assert_eq!(terminal.state.status, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn a_ready_session_cannot_be_replaced_before_its_start_command() {
+        let service = SessionService::default();
+        let first = service.start(config(81)).unwrap();
+        assert_eq!(
+            service.start(config(82)).unwrap_err(),
+            "A session is already active"
+        );
+        assert_eq!(service.snapshot().unwrap().session_id, first.session_id);
     }
 }

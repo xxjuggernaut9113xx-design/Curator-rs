@@ -13,10 +13,6 @@ use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 
 use crate::chpack::{build_chpack, safe_pack_filename, ExportRow};
-use crate::db::{now_iso, save_settings};
-use crate::routes::media::db_err;
-use crate::routes::sources::create_sources_from_urls;
-use crate::slug::normalize_for_compare;
 use crate::AppState;
 
 // ─── GET /api/export ─────────────────────────────────────────────────────────
@@ -24,45 +20,23 @@ use crate::AppState;
 pub async fn export_sources(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // rusqlite's Connection/Statement are !Send, so they must be dropped
-    // before the `.await` below rather than held across it.
-    let sources: Vec<Value> = {
-        let conn = state.pool.get().map_err(db_err)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.name, s.url, s.included, g.name AS group_name \
-             FROM sources s LEFT JOIN groups g ON g.id = s.group_id \
-             ORDER BY s.added_at",
-            )
-            .map_err(db_err)?;
-
-        let out = stmt
-            .query_map([], |r| {
-                Ok(json!({
-                    "name":     r.get::<_, String>(0)?,
-                    "url":      r.get::<_, String>(1)?,
-                    "included": r.get::<_, i64>(2)? != 0,
-                    "group":    r.get::<_, Option<String>>(3)?,
-                }))
-            })
-            .map_err(db_err)?
-            .filter_map(|r| r.ok())
-            .collect();
-        out
-    };
-
-    let exported_at = now_iso();
-
-    // Reset backup reminder clock
-    {
-        let mut settings = state.settings.write().await;
-        settings.last_export_at = Some(exported_at.clone());
-        settings.export_reminder_snoozed_until = None;
-        save_settings(&state.data_dir, &settings);
-    }
-
+    let result = crate::services::export::source_list(&state)
+        .await
+        .map_err(|error| {
+            let status = match error {
+                crate::services::export::ExportError::Forbidden => StatusCode::FORBIDDEN,
+                crate::services::export::ExportError::ShuttingDown
+                | crate::services::export::ExportError::MaintenanceActive => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                crate::services::export::ExportError::Database(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            (status, Json(json!({"error": error.message()})))
+        })?;
     Ok(Json(
-        json!({ "exported_at": exported_at, "sources": sources }),
+        serde_json::to_value(result).expect("serializable source export"),
     ))
 }
 
@@ -77,94 +51,25 @@ pub async fn import_sources(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ImportBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let urls: Vec<String> = body
-        .sources
-        .iter()
-        .filter_map(|s| s.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .collect();
-
-    if urls.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "No valid entries to import"})),
-        ));
-    }
-
-    let result = create_sources_from_urls(Arc::clone(&state), urls).await?;
-
-    // Best-effort: restore group assignments from the import file
-    if result["sources"]
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false)
-    {
-        let entries_by_url: std::collections::HashMap<String, String> = body
-            .sources
-            .iter()
-            .filter_map(|s| {
-                let url = s.get("url")?.as_str()?.to_string();
-                let group = s.get("group")?.as_str()?.to_string();
-                if group.is_empty() {
-                    return None;
+    let result = crate::services::export::import_source_list(state, body.sources)
+        .await
+        .map_err(|error| {
+            use crate::services::sources::SourceError;
+            let status = match error {
+                SourceError::Forbidden => StatusCode::FORBIDDEN,
+                SourceError::ShuttingDown | SourceError::MaintenanceActive => {
+                    StatusCode::SERVICE_UNAVAILABLE
                 }
-                Some((normalize_for_compare(&url), group))
-            })
-            .collect();
-
-        if !entries_by_url.is_empty() {
-            let conn = state.pool.get().map_err(db_err)?;
-            let mut group_by_name: std::collections::HashMap<String, i64> = {
-                let mut stmt = conn
-                    .prepare("SELECT id, name FROM groups")
-                    .map_err(db_err)?;
-                let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(0)?)))
-                    .map_err(db_err)?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                rows
+                SourceError::InvalidInput(_) | SourceError::InvalidUrl(_) => {
+                    StatusCode::BAD_REQUEST
+                }
+                SourceError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
-
-            if let Some(created) = result["sources"].as_array() {
-                for src in created {
-                    let url = src["url"].as_str().unwrap_or("");
-                    let src_id = src["id"].as_i64().unwrap_or(0);
-                    if src_id == 0 {
-                        continue;
-                    }
-
-                    let gname = match entries_by_url.get(&normalize_for_compare(url)) {
-                        Some(g) => g.clone(),
-                        None => continue,
-                    };
-
-                    let gid = if let Some(&id) = group_by_name.get(&gname) {
-                        id
-                    } else {
-                        conn.execute(
-                            "INSERT INTO groups (name, added_at) VALUES (?1,?2)",
-                            rusqlite::params![gname, now_iso()],
-                        )
-                        .map_err(db_err)?;
-                        let new_id = conn.last_insert_rowid();
-                        group_by_name.insert(gname, new_id);
-                        new_id
-                    };
-
-                    let _ = conn.execute(
-                        "UPDATE sources SET group_id=?1 WHERE id=?2",
-                        rusqlite::params![gid, src_id],
-                    );
-                }
-            }
-
-            // Invalidate group tag cache
-            drop(conn);
-            *state.group_tag_cache.write().await = None;
-        }
-    }
-
-    Ok(Json(result))
+            (status, Json(json!({"error": error.message()})))
+        })?;
+    Ok(Json(
+        serde_json::to_value(result).expect("serializable source import"),
+    ))
 }
 
 // ─── POST /api/export/chpack ─────────────────────────────────────────────────

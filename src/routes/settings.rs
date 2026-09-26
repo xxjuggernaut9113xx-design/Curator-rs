@@ -24,39 +24,7 @@ fn host_integrations_available(state: &AppState, peer: &Option<ConnectInfo<Socke
 /// Shared with `routes::oobe` (the Appearance step reuses the exact same
 /// allow-list rather than re-declaring it) — see "Do not introduce
 /// conflicting configuration systems" in the OOBE build notes.
-pub(crate) const VALID_THEMES: &[&str] = &[
-    // Current Explorer palettes.
-    "system",
-    "atelier-dark",
-    "midnight",
-    "ember",
-    "linen",
-    "sage",
-    "aurora",
-    "oled",
-    // Known GTK families are mapped to Curator palettes. We deliberately do
-    // not accept arbitrary theme names or attempt to parse GTK stylesheets.
-    "gtk-system",
-    "adwaita-light",
-    "adwaita-dark",
-    "yaru-light",
-    "yaru-dark",
-    "arc-light",
-    "arc-dark",
-    "breeze-light",
-    "breeze-dark",
-    // Legacy names remain accepted so an older settings.json can be opened
-    // and normalized by the browser without becoming an invalid preference.
-    "yotsuba",
-    "yotsuba-b",
-    "futaba",
-    "burichan",
-    "tomorrow",
-    "photon",
-    "light",
-    "oled-dark",
-    "dark",
-];
+pub(crate) use crate::services::settings::VALID_THEMES;
 
 // `Option<Option<T>>` normally cannot distinguish a missing JSON property
 // from an explicit `null`. Settings uses that distinction for optional byte
@@ -152,17 +120,17 @@ pub async fn get(
     State(state): State<Arc<AppState>>,
     peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Json<Value> {
-    let host_integrations = host_integrations_available(&state, &peer);
-    // This is deliberately performed on every local Settings open. A stale
-    // JSON preference is not enough evidence that Windows will actually
-    // launch Curator after sign-in.
-    let startup = if host_integrations {
-        Some(crate::reconcile_start_with_windows_preference(&state).await)
+    Json(crate::services::settings::read(&state, settings_audience(&peer)).await)
+}
+
+fn settings_audience(
+    peer: &Option<ConnectInfo<SocketAddr>>,
+) -> crate::services::settings::SettingsAudience {
+    if is_local_client(peer) {
+        crate::services::settings::SettingsAudience::Local
     } else {
-        None
-    };
-    let s = state.settings.read().await;
-    Json(settings_response(&state, &peer, &s, startup))
+        crate::services::settings::SettingsAudience::Remote
+    }
 }
 
 fn settings_response(
@@ -171,33 +139,7 @@ fn settings_response(
     settings: &crate::db::Settings,
     startup: Option<crate::StartupRegistration>,
 ) -> Value {
-    let mut value = serde_json::to_value(settings).unwrap_or_default();
-    let config = crate::config::load_config_for(state.install_scope);
-    if let Some(object) = value.as_object_mut() {
-        let local = is_local_client(peer);
-        let host_integrations = host_integrations_available(state, peer);
-        object.insert(
-            "host_integration_settings_available".into(),
-            json!(host_integrations),
-        );
-        if local {
-            object.insert(
-                "ffmpeg_bin".into(),
-                json!(config.ffmpeg_bin.unwrap_or_else(|| "ffmpeg".into())),
-            );
-            object.insert(
-                "external_tool_settings_restart_required".into(),
-                json!(true),
-            );
-            if let Some(startup) = startup {
-                object.insert("startup_registration".into(), json!(startup));
-            }
-        } else {
-            object.insert("external_tool_settings_local_only".into(), json!(true));
-            object.insert("local_integration_settings_local_only".into(), json!(true));
-        }
-    }
-    value
+    crate::services::settings::response(state, settings_audience(peer), settings, startup)
 }
 
 // ─── PATCH /api/settings ─────────────────────────────────────────────────────

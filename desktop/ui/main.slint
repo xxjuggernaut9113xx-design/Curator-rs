@@ -1,9 +1,23 @@
-import { Button, CheckBox, ComboBox, LineEdit, ScrollView, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView, HorizontalBox, VerticalBox, Palette, Slider } from "std-widgets.slint";
 
 export struct MediaRow { title: string, detail: string, selected: bool }
 export struct DownloadRow { label: string, phase: string }
+export struct DiscoveryRow { title: string, detail: string, selected: bool }
+
+export component CuratorTray inherits SystemTrayIcon {
+    icon: @image-url("../icons/icon.png");
+    tooltip: "Curator Host";
+    Menu {
+        MenuItem { title: "Show Curator"; activated => { root.show-window(); } }
+        MenuSeparator {}
+        MenuItem { title: "Quit Curator"; activated => { root.quit(); } }
+    }
+    callback show-window();
+    callback quit();
+}
+
 export component CuratorNativeWindow inherits Window {
-    title: (root.local-host ? "Curator Host" : "Curator Viewer") + " — " + (root.workspace == 0 ? root.location-title : root.workspace == 1 ? "Player" : "Manage");
+    title: (root.local-host ? "Curator Host" : "Curator Viewer") + " — " + (root.workspace == 0 ? root.location-title : root.workspace == 1 ? "Player" : root.workspace == 2 ? "Feed" : root.workspace == 3 ? "Review" : root.workspace == 4 ? "GOON" : "Manage");
     preferred-width: 1200px; preferred-height: 800px;
     min-width: 800px; min-height: 560px;
     in-out property <int> workspace: 0;
@@ -12,29 +26,50 @@ export component CuratorNativeWindow inherits Window {
     in-out property <[string]> navigation;
     in-out property <[string]> groups;
     in-out property <string> status;
-    in-out property <string> inspector;
+      in-out property <string> inspector;
+      in-out property <bool> can-undo-rating: false;
     in-out property <string> location-title: "All sources and groups";
     in-out property <string> download-status;
     in-out property <[DownloadRow]> download-sources;
     in-out property <image> preview;
     in-out property <string> playing;
+    in-out property <string> player-status: "Choose media to play";
+    in-out property <float> player-progress: 0;
+    in-out property <float> player-duration: 0;
+    in-out property <float> player-volume: 100;
+    in-out property <float> player-speed: 1;
+    in-out property <bool> player-paused: false;
+    in-out property <bool> player-looping: false;
+    callback player-control(string, float);
+    callback feed-control(string);
+    in-out property <string> review-status: "Start review to rate unreviewed media";
+    callback review-control(string, int);
+    in-out property <string> goon-status: "Use the existing session controls to run a rating-paced GOON session.";
     in-out property <string> session-status;
     callback session-control(string);
     callback fullscreen();
+    callback switch-host();
     in-out property <bool> busy;
     in-out property <bool> has-more;
     in-out property <bool> has-previous;
     in-out property <bool> local-host;
-    callback browse(string, string, string, string, string, bool);
+    in-out property <bool> can-edit-library;
+    in-out property <bool> can-control-sessions;
+    in-out property <bool> can-playback;
+    in-out property <bool> can-discover;
+    callback browse(bool);
     callback previous-page();
     callback import-folder();
+    callback export-sources();
+    callback import-sources();
     callback navigate(int);
     callback create-group(string);
     callback move-to-group(int);
     callback select-item(int, bool);
     callback rate(int);
     callback tag(string);
-    callback approve();
+      callback approve();
+      callback undo-rating();
     callback enqueue(bool);
     callback play(int);
     callback remove-queued(int);
@@ -47,6 +82,9 @@ export component CuratorNativeWindow inherits Window {
     in-out property <[string]> discovery-providers: ["All providers"];
     callback discover(string, int);
     callback queue-discovery();
+    in-out property <[DiscoveryRow]> discovery-results;
+    in-out property <int> discovery-selected-count: 0;
+    callback select-discovery(int, bool);
     callback save-theme(string);
     callback delete-selected();
     callback refresh-selected();
@@ -58,36 +96,147 @@ export component CuratorNativeWindow inherits Window {
     in-out property <string> discovery-status;
     in-out property <int> selected-count;
     in-out property <bool> settings-open: false;
+    in-out property <bool> settings-loaded: false;
+    in-out property <bool> settings-saving: false;
+    in-out property <string> settings-error;
+    in-out property <int> settings-page: 0;
+    in-out property <string> settings-draft-theme: "system";
+    in-out property <bool> settings-draft-tray: true;
+    in-out property <string> settings-draft-layout: "grid";
+    in-out property <string> settings-draft-concurrent: "4";
+    in-out property <string> settings-draft-max-file-bytes;
+    in-out property <string> settings-draft-max-source-bytes;
+    in-out property <string> settings-draft-min-free-bytes;
+    in-out property <string> settings-draft-cache-bytes;
+    in-out property <string> settings-draft-max-clip-seconds: "60";
+    in-out property <string> settings-draft-slideshow-ms: "3000";
+    in-out property <bool> settings-draft-slideshow-loop: true;
+    in-out property <bool> settings-draft-slideshow-shuffle: false;
+    in-out property <bool> settings-draft-metronome: false;
+    in-out property <string> settings-draft-reminder-days: "30";
+    in-out property <length> settings-general-scroll-y: 0px;
+    in-out property <length> settings-media-scroll-y: 0px;
+    in-out property <length> settings-appearance-scroll-y: 0px;
+    in-out property <length> settings-playback-scroll-y: 0px;
+    in-out property <length> settings-automation-scroll-y: 0px;
+    in-out property <length> settings-admin-scroll-y: 0px;
+    in-out property <int> manage-page: 0;
+    callback manage-destination(int);
+    in-out property <string> manage-source-url;
+    in-out property <string> manage-group-name;
+    in-out property <string> manage-tag-draft;
+    in-out property <int> manage-target-group;
+    in-out property <string> manage-discovery-query;
+    in-out property <int> manage-discovery-provider;
+    in-out property <string> manage-theme: "system";
+    in-out property <[string]> recovery-backups;
+    in-out property <int> recovery-selected-backup: 0;
+    in-out property <bool> recovery-has-backups: false;
+    in-out property <string> manage-confirmation;
+    in-out property <string> maintenance-action: "Reconcile library";
+    in-out property <string> maintenance-confirmation;
+    private property <string> maintenance-required-phrase:
+        root.maintenance-action == "Clear human ratings" ? "CLEAR HUMAN RATINGS" :
+        root.maintenance-action == "Reset ratings and evidence" ? "RESET RATINGS" :
+        root.maintenance-action == "Flatten groups" ? "FLATTEN GROUPS" :
+        root.maintenance-action == "Delete groups" ? "DELETE GROUPS" :
+        root.maintenance-action == "Clear tag assignments" ? "CLEAR TAG ASSIGNMENTS" :
+        root.maintenance-action == "Clear session history" ? "CLEAR SESSION HISTORY" :
+        root.maintenance-action == "Rebuild caches" ? "REBUILD CACHES" :
+        root.maintenance-action == "Factory reset" ? "RESET CURATOR" :
+        root.maintenance-action == "Remove P-HAR" ? "DELETE P-HAR" :
+        root.maintenance-action == "Remove archives" ? "DELETE ARCHIVES" : "";
+    in-out property <length> manage-discover-scroll-y: 0px;
+    in-out property <length> manage-activity-scroll-y: 0px;
+    in-out property <length> manage-sources-scroll-y: 0px;
+    in-out property <length> manage-settings-scroll-y: 0px;
+    in-out property <length> manage-log-scroll-y: 0px;
+    in-out property <length> manage-recovery-scroll-y: 0px;
     in-out property <string> settings-theme: "system";
+    in-out property <color> custom-background: #121214;
+    in-out property <color> custom-panel: #19191c;
+    in-out property <color> custom-elevated: #201f23;
+    in-out property <color> custom-text: #edebe6;
+    in-out property <color> custom-muted: #8c8a85;
+    in-out property <color> custom-line: #353438;
+    in-out property <color> custom-accent: #e8a33d;
+    in-out property <color> custom-selection: #6b4e1e;
+    in-out property <color> custom-selection-text: #ffffff;
+    private property <brush> theme-background: root.settings-theme == "system" ? Palette.background : root.custom-background;
+    private property <brush> theme-panel: root.settings-theme == "system" ? Palette.background : root.custom-panel;
+    private property <brush> theme-elevated: root.settings-theme == "system" ? Palette.alternate-background : root.custom-elevated;
+    private property <brush> theme-text: root.settings-theme == "system" ? Palette.foreground : root.custom-text;
+    private property <brush> theme-muted: root.settings-theme == "system" ? Palette.alternate-foreground : root.custom-muted;
+    private property <brush> theme-line: root.settings-theme == "system" ? Palette.border : root.custom-line;
+    private property <brush> theme-accent: root.settings-theme == "system" ? Palette.accent-background : root.custom-accent;
+    private property <brush> theme-selection: root.settings-theme == "system" ? Palette.selection-background : root.custom-selection;
+    private property <brush> theme-selection-text: root.settings-theme == "system" ? Palette.selection-foreground : root.custom-selection-text;
+    in-out property <ColorScheme> palette-scheme <=> Palette.color-scheme;
+    changed settings-theme => {
+        root.palette-scheme = root.settings-theme == "linen" || root.settings-theme == "sage"
+            || root.settings-theme == "adwaita-light" || root.settings-theme == "yaru-light"
+            || root.settings-theme == "arc-light" || root.settings-theme == "breeze-light"
+            ? ColorScheme.light
+            : root.settings-theme == "system" ? ColorScheme.unknown : ColorScheme.dark;
+    }
     in-out property <bool> settings-tray: true;
     in-out property <string> settings-layout: "grid";
     in-out property <length> library-scroll-y: 0px;
+    in-out property <length> inspector-scroll-y: 0px;
+    in-out property <length> manage-organization-scroll-y: 0px;
+    in-out property <string> filter-kind: "All media";
+    in-out property <string> filter-sort: "date_desc";
+    in-out property <string> filter-review: "all";
+    in-out property <string> filter-search;
+    in-out property <string> filter-tag;
+    in-out property <string> filter-all-tags;
+    in-out property <string> filter-any-tags;
+    in-out property <string> filter-exclude-tags;
+    in-out property <string> filter-creator;
+    in-out property <string> filter-rating: "Any rating";
+    in-out property <string> filter-min-size;
+    in-out property <string> filter-max-size;
+    in-out property <bool> filter-unknown-size;
     private property <int> grid-columns: root.width >= 1400px ? 4 : root.width >= 1000px ? 3 : 2;
-    callback save-settings(string, bool, string);
+    callback open-settings();
+    callback save-settings() -> bool;
+    background: root.theme-background;
 
     VerticalBox {
         padding: 16px; spacing: 12px;
         HorizontalBox {
             Text { text: root.local-host ? "Curator Host" : "Curator Viewer"; font-size: 28px; font-weight: 700; }
-            Button { text: "File"; clicked => { root.workspace = 0; } }
-            Button { text: "Tools"; clicked => { root.workspace = 2; } }
-            for label[index] in ["Library", "Player", "Manage"]: Button {
+            if !root.local-host: Button { text: "Switch Host"; clicked => { root.switch-host(); } }
+            Button { text: "Library"; clicked => { root.workspace = 0; } }
+            for label[index] in ["Library", "Player", "Feed", "Review", "GOON", "Manage"]: Button {
                 text: label; primary: root.workspace == index;
                 clicked => { root.workspace = index; }
             }
         }
         if root.workspace == 0: VerticalBox {
             HorizontalBox {
-                types := ComboBox { model: ["All media", "image", "clip", "video"]; }
-                sorts := ComboBox { model: ["date_desc", "date_asc", "filename_asc", "filename_desc", "rating_desc", "size_desc"]; }
-                reviews := ComboBox { model: ["all", "unrated", "auto", "needs_review", "reviewed"]; }
+                ComboBox { model: ["All media", "image", "clip", "video"]; current-value <=> root.filter-kind; }
+                ComboBox { model: ["date_desc", "date_asc", "filename_asc", "filename_desc", "rating_desc", "rating_asc", "size_desc", "size_asc", "shuffle"]; current-value <=> root.filter-sort; }
+                ComboBox { model: ["all", "unrated", "auto", "needs_review", "reviewed"]; current-value <=> root.filter-review; }
+                ComboBox { model: ["Any rating", "0", "1", "2", "3", "4", "5"]; current-value <=> root.filter-rating; }
             }
             HorizontalBox {
-                search := LineEdit { placeholder-text: "Search filename, source, or creator"; }
-                filter-tag := LineEdit { placeholder-text: "Filter by tag"; }
-                Button { text: "Search / refresh"; enabled: !root.busy; clicked => { root.browse(types.current-value, sorts.current-value, search.text, reviews.current-value, filter-tag.text, false); } }
+                LineEdit { placeholder-text: "Search filename, source, or creator"; text <=> root.filter-search; }
+                LineEdit { placeholder-text: "Tag"; text <=> root.filter-tag; }
+                LineEdit { placeholder-text: "Creator"; text <=> root.filter-creator; }
+            }
+            HorizontalBox {
+                LineEdit { placeholder-text: "All tags (comma separated)"; text <=> root.filter-all-tags; }
+                LineEdit { placeholder-text: "Any tags"; text <=> root.filter-any-tags; }
+                LineEdit { placeholder-text: "Exclude tags"; text <=> root.filter-exclude-tags; }
+            }
+            HorizontalBox {
+                LineEdit { placeholder-text: "Minimum bytes"; text <=> root.filter-min-size; }
+                LineEdit { placeholder-text: "Maximum bytes"; text <=> root.filter-max-size; }
+                CheckBox { text: "Unknown size"; checked <=> root.filter-unknown-size; }
+                Button { text: "Search / refresh"; enabled: !root.busy; clicked => { root.browse(false); } }
                 Button { text: "Previous page"; enabled: !root.busy && root.has-previous; clicked => { root.previous-page(); } }
-                Button { text: "Next page"; enabled: !root.busy && root.has-more; clicked => { root.browse(types.current-value, sorts.current-value, search.text, reviews.current-value, filter-tag.text, true); } }
+                Button { text: "Next page"; enabled: !root.busy && root.has-more; clicked => { root.browse(true); } }
             }
             HorizontalBox {
                 ScrollView { horizontal-stretch: 1; VerticalBox {
@@ -118,40 +267,43 @@ export component CuratorNativeWindow inherits Window {
                                 row: index / root.grid-columns;
                                 col: Math.mod(index, root.grid-columns);
                                 min-width: 160px; height: 112px;
-                                background: entry.selected ? #354b68 : #242d3b;
+                                background: entry.selected ? root.theme-selection : root.theme-elevated;
                                 border-width: 1px;
-                                border-color: entry.selected ? #83b7ff : #566579;
+                                border-color: entry.selected ? root.theme-accent : root.theme-line;
                                 VerticalBox {
                                     padding: 8px; spacing: 5px;
                                     CheckBox { text: "Select"; checked: entry.selected; toggled => { root.select-item(index, self.checked); } }
                                     Button { text: entry.title; clicked => { root.select-item(index, !entry.selected); } }
-                                    Text { text: entry.detail; color: #edf2fa; overflow: elide; }
+                                    Text { text: entry.detail; color: entry.selected ? root.theme-selection-text : root.theme-text; overflow: elide; }
                                 }
                             }
                         }
                     }
                 }
-                VerticalBox {
-                    horizontal-stretch: 1;
+                ScrollView {
+                    horizontal-stretch: 2;
+                    content-y <=> root.inspector-scroll-y;
+                    VerticalBox {
                     Text { text: "Selection (" + root.selected-count + ")"; font-size: 20px; }
                     Text { text: root.inspector; wrap: word-wrap; }
-                    HorizontalBox {
+                    if root.can-edit-library: HorizontalBox {
                         for stars in [1, 2, 3, 4, 5]: Button { text: stars + " ★"; enabled: !root.busy; clicked => { root.rate(stars); } }
                     }
-                    tags := LineEdit { placeholder-text: "Tag for selected items"; }
-                    Button { text: "Add tag"; enabled: !root.busy; clicked => { root.tag(tags.text); } }
-                    Button { text: "Approve suggestions"; enabled: !root.busy; clicked => { root.approve(); } }
+                    if root.can-edit-library: LineEdit { placeholder-text: "Tag for selected items"; text <=> root.manage-tag-draft; }
+                    if root.can-edit-library: Button { text: "Add tag"; enabled: !root.busy; clicked => { root.tag(root.manage-tag-draft); } }
+                     if root.can-edit-library: Button { text: "Approve suggestions"; enabled: !root.busy; clicked => { root.approve(); } }
+                     if root.can-edit-library: Button { text: "Undo rating review"; enabled: !root.busy && root.can-undo-rating; clicked => { root.undo-rating(); } }
                     if root.local-host: Button { text: "Refresh metadata"; enabled: !root.busy; clicked => { root.refresh-selected(); } }
                     if root.local-host: VerticalBox {
                         delete-confirmation := LineEdit { placeholder-text: "Type DELETE " + root.selected-count + " to remove files"; }
                         Button { text: "Delete " + root.selected-count + " selected media"; enabled: !root.busy && root.selected-count > 0 && delete-confirmation.text == "DELETE " + root.selected-count; clicked => { root.delete-selected(); delete-confirmation.text = ""; } }
                     }
-                    Button { text: "Split selected video into 60-second clips"; enabled: !root.busy; clicked => { root.clip-selected(60); } }
-                    target-group := ComboBox { model: root.groups; }
-                    Button { text: "Move selection to group"; enabled: !root.busy; clicked => { root.move-to-group(target-group.current-index); } }
-                    Button { text: "Play selection"; clicked => { root.enqueue(true); root.workspace = 1; } }
-                    Button { text: "Append to queue"; clicked => { root.enqueue(false); } }
-                    Rectangle { vertical-stretch: 1; }
+                    if root.can-edit-library: Button { text: "Split selected video into 60-second clips"; enabled: !root.busy; clicked => { root.clip-selected(60); } }
+                    if root.can-edit-library: ComboBox { model: root.groups; current-index <=> root.manage-target-group; }
+                    if root.can-edit-library: Button { text: "Move selection to group"; enabled: !root.busy; clicked => { root.move-to-group(root.manage-target-group); } }
+                    if root.can-playback: Button { text: "Play selection"; clicked => { root.enqueue(true); root.workspace = 1; } }
+                    if root.can-playback: Button { text: "Append to queue"; clicked => { root.enqueue(false); } }
+                    }
                 }
             }
         }
@@ -159,10 +311,30 @@ export component CuratorNativeWindow inherits Window {
             VerticalBox {
                 horizontal-stretch: 3;
                 Text { text: root.playing; wrap: word-wrap; }
-                Button { text: "Fullscreen / windowed"; clicked => { root.fullscreen(); } }
+                Text { text: root.player-status; wrap: word-wrap; color: root.theme-muted; }
+                HorizontalBox {
+                    Button { text: root.player-paused ? "Resume" : "Pause"; clicked => { root.player-control(root.player-paused ? "resume" : "pause", 0); } }
+                    Button { text: "−10s"; clicked => { root.player-control("seek-relative", -10); } }
+                    Button { text: "+10s"; clicked => { root.player-control("seek-relative", 10); } }
+                    Button { text: "0.75×"; clicked => { root.player-control("speed", 0.75); } }
+                    Button { text: "1×"; clicked => { root.player-control("speed", 1); } }
+                    Button { text: "1.5×"; clicked => { root.player-control("speed", 1.5); } }
+                    Button { text: "2×"; clicked => { root.player-control("speed", 2); } }
+                    Button { text: "Fullscreen"; clicked => { root.fullscreen(); } }
+                }
+                HorizontalBox {
+                    Text { text: "Progress"; }
+                    Slider { minimum: 0; maximum: root.player-duration > 0 ? root.player-duration : 1; value <=> root.player-progress; changed value => { root.player-control("seek", self.value); } }
+                    Text { text: root.player-progress + " / " + root.player-duration + " sec"; }
+                }
+                HorizontalBox {
+                    Text { text: "Volume"; }
+                    Slider { minimum: 0; maximum: 100; value <=> root.player-volume; changed value => { root.player-control("volume", self.value); } }
+                    CheckBox { text: "Loop"; checked <=> root.player-looping; toggled => { root.player-control("loop", self.checked ? 1 : 0); } }
+                }
                 Image { source: root.preview; image-fit: contain; vertical-stretch: 1; }
                 Text { text: root.session-status; wrap: word-wrap; }
-                HorizontalBox {
+                if root.can-control-sessions: HorizontalBox {
                     for command in ["Start", "Pause", "Resume", "End"]: Button { text: command + " session"; clicked => { root.session-control(command); } }
                 }
             }
@@ -178,22 +350,78 @@ export component CuratorNativeWindow inherits Window {
             }
         }
         if root.workspace == 2: VerticalBox {
-            Text { text: "Sources and downloads"; font-size: 22px; }
-            source := LineEdit { placeholder-text: "Source URL"; }
-            Button { text: "Add source"; enabled: !root.busy; clicked => { root.add-sources(source.text); } }
-            if root.local-host: Button { text: "Import local folder…"; enabled: !root.busy; clicked => { root.import-folder(); } }
+            Text { text: "Feed"; font-size: 22px; }
+            Text { text: "Continuous native playback uses the current library order and never repeats the current item."; wrap: word-wrap; color: root.theme-muted; }
+            Text { text: root.playing; wrap: word-wrap; }
+            Text { text: root.player-status; wrap: word-wrap; }
             HorizontalBox {
-                group-name := LineEdit { placeholder-text: "New group name"; }
-                Button { text: "Create group"; enabled: !root.busy; clicked => { root.create-group(group-name.text); } }
+                Button { text: "Start / restart feed"; enabled: root.can-playback; clicked => { root.feed-control("start"); } }
+                Button { text: "Next ready item"; enabled: root.can-playback; clicked => { root.feed-control("next"); } }
+                Button { text: root.player-paused ? "Resume" : "Pause"; clicked => { root.player-control(root.player-paused ? "resume" : "pause", 0); } }
+                Button { text: "Fullscreen"; clicked => { root.fullscreen(); } }
             }
+            Image { source: root.preview; image-fit: contain; vertical-stretch: 1; }
+        }
+        if root.workspace == 3: VerticalBox {
+            Text { text: "Review"; font-size: 22px; }
+            Text { text: root.review-status; wrap: word-wrap; color: root.theme-muted; }
+            Text { text: root.playing; wrap: word-wrap; }
             HorizontalBox {
+                Button { text: "Start review"; enabled: root.can-edit-library; clicked => { root.review-control("start", 0); } }
+                Button { text: "Skip"; enabled: root.can-edit-library; clicked => { root.review-control("skip", 0); } }
+                Button { text: "Approve"; enabled: root.can-edit-library; clicked => { root.review-control("approve", 0); } }
+                for stars in [1, 2, 3, 4, 5]: Button { text: stars + " ★"; enabled: root.can-edit-library; clicked => { root.review-control("rate", stars); } }
+                Button { text: "Undo"; enabled: root.can-edit-library; clicked => { root.review-control("undo", 0); } }
+            }
+            Image { source: root.preview; image-fit: contain; vertical-stretch: 1; }
+        }
+        if root.workspace == 4: VerticalBox {
+            Text { text: "GOON"; font-size: 22px; }
+            Text { text: root.goon-status; wrap: word-wrap; color: root.theme-muted; }
+            Text { text: root.session-status; wrap: word-wrap; }
+            HorizontalBox {
+                Button { text: "Start GOON session"; enabled: root.can-control-sessions; clicked => { root.session-control("Start"); } }
+                Button { text: "Pause"; enabled: root.can-control-sessions; clicked => { root.session-control("Pause"); } }
+                Button { text: "Resume"; enabled: root.can-control-sessions; clicked => { root.session-control("Resume"); } }
+                Button { text: "End"; enabled: root.can-control-sessions; clicked => { root.session-control("End"); } }
+            }
+            Text { text: "GOON uses the existing Rust session timing and media ratings. Music, beat maps, speech, Cock Hero, and VR are intentionally outside this Host workflow."; wrap: word-wrap; }
+        }
+        if root.workspace == 5: VerticalBox {
+            HorizontalBox {
+                for destination[index] in ["Discover", "Organization", "Activity", "Settings"]: Button {
+                    text: destination; primary: root.manage-page == index;
+                    clicked => { root.manage-destination(index); }
+                }
+            }
+            if root.manage-page == 1: ScrollView {
+            vertical-stretch: 1;
+            content-y <=> root.manage-organization-scroll-y;
+            VerticalBox {
+            Text { text: "Sources and downloads"; font-size: 22px; }
+            if root.local-host: LineEdit { placeholder-text: "Source URL"; text <=> root.manage-source-url; }
+            if root.local-host: Button { text: "Add source"; enabled: !root.busy; clicked => { root.add-sources(root.manage-source-url); } }
+            if root.local-host: Button { text: "Export source list"; enabled: !root.busy; clicked => { root.export-sources(); } }
+            if root.local-host: Button { text: "Import source list"; enabled: !root.busy; clicked => { root.import-sources(); } }
+            if root.local-host: Button { text: "Import local folder…"; enabled: !root.busy; clicked => { root.import-folder(); } }
+            if root.local-host: HorizontalBox {
+                group-name := LineEdit { placeholder-text: "New group name"; text <=> root.manage-group-name; }
+                Button { text: "Create group"; enabled: !root.busy; clicked => { root.create-group(root.manage-group-name); } }
+            }
+            if root.local-host: Button { text: "Resync all sources"; enabled: !root.busy; clicked => { root.resync-all(); } }
+            Rectangle { vertical-stretch: 1; }
+            }
+            }
+            if root.manage-page == 2: VerticalBox {
+            vertical-stretch: 1;
+            if root.local-host: HorizontalBox {
                 Button { text: "Pause downloads"; enabled: !root.busy; clicked => { root.downloads(true); } }
                 Button { text: "Resume downloads"; enabled: !root.busy; clicked => { root.downloads(false); } }
-                Button { text: "Resync all sources"; enabled: !root.busy; clicked => { root.resync-all(); } }
             }
-            ScrollView { Text { text: root.download-status; wrap: word-wrap; } }
+            ScrollView { content-y <=> root.manage-activity-scroll-y; VerticalBox { Text { text: root.download-status; wrap: word-wrap; } Rectangle { vertical-stretch: 1; } } }
             if root.local-host: ScrollView {
                 min-height: 100px;
+                content-y <=> root.manage-sources-scroll-y;
                 VerticalBox {
                     for entry[index] in root.download-sources: HorizontalBox {
                         Text { text: entry.label + " — " + entry.phase; horizontal-stretch: 1; overflow: elide; }
@@ -202,37 +430,36 @@ export component CuratorNativeWindow inherits Window {
                     }
                 }
             }
+            }
+            if root.manage-page == 0: VerticalBox {
+            vertical-stretch: 1;
             Text { text: "Discovery"; font-size: 22px; }
             HorizontalBox {
-                discovery-provider := ComboBox { model: root.discovery-providers; }
-                discovery-query := LineEdit { placeholder-text: "Find collections, creators, or a page URL"; }
-                Button { text: "Search"; enabled: !root.busy; clicked => { root.discover(discovery-query.text, discovery-provider.current-index); } }
-                Button { text: "Queue compatible results"; enabled: !root.busy; clicked => { root.queue-discovery(); } }
+                discovery-provider := ComboBox { model: root.discovery-providers; current-index <=> root.manage-discovery-provider; }
+                discovery-query := LineEdit { placeholder-text: "Find collections, creators, or a page URL"; text <=> root.manage-discovery-query; }
+                Button { text: "Search"; enabled: root.can-discover && !root.busy; clicked => { root.discover(root.manage-discovery-query, root.manage-discovery-provider); } }
+                if root.local-host: Button { text: "Queue selected results (" + root.discovery-selected-count + ")"; enabled: !root.busy && root.discovery-selected-count > 0; clicked => { root.queue-discovery(); } }
             }
-            ScrollView { min-height: 100px; Text { text: root.discovery-status; wrap: word-wrap; } }
+            ScrollView { min-height: 100px; content-y <=> root.manage-discover-scroll-y; VerticalBox {
+                Text { text: root.discovery-status; wrap: word-wrap; }
+                for result[index] in root.discovery-results: HorizontalBox {
+                    CheckBox { checked: result.selected; toggled => { root.select-discovery(index, self.checked); } }
+                    VerticalBox { Text { text: result.title; } Text { text: result.detail; color: root.theme-muted; wrap: word-wrap; } }
+                }
+            } }
+            }
+            if root.manage-page == 3: VerticalBox {
+            vertical-stretch: 1;
             Text { text: "Settings and diagnostics"; font-size: 22px; }
             HorizontalBox {
-                theme := ComboBox { model: ["system", "atelier-dark", "midnight", "ember", "linen", "sage", "aurora", "oled"]; }
-                Button { text: "Save native theme"; enabled: !root.busy; clicked => { root.save-theme(theme.current-value); } }
-                Button { text: "Settings…"; enabled: !root.busy; clicked => { root.settings-open = true; } }
+                theme := ComboBox { model: ["system", "gtk-system", "adwaita-light", "adwaita-dark", "yaru-light", "yaru-dark", "arc-light", "arc-dark", "breeze-light", "breeze-dark", "atelier-dark", "midnight", "ember", "linen", "sage", "aurora", "oled"]; current-value <=> root.manage-theme; }
+                Button { text: "Save native theme"; enabled: !root.busy; clicked => { root.save-theme(root.manage-theme); } }
+                Button { text: "Settings…"; enabled: !root.busy && (!root.local-host || root.settings-loaded); clicked => { root.open-settings(); } }
                 Button { text: "Refresh diagnostics"; clicked => { root.refresh-manage(); } }
                 if root.local-host: Button { text: "View diagnostic log"; clicked => { root.refresh-diagnostic-log(); } }
             }
-            ScrollView { min-height: 100px; Text { text: root.manage-status; wrap: word-wrap; } }
-            ScrollView { min-height: 100px; Text { text: root.diagnostic-log; wrap: word-wrap; } }
-            if root.local-host: VerticalBox {
-                Text { text: "Backups and recovery"; font-size: 22px; }
-                HorizontalBox {
-                    Button { text: "Create backup"; clicked => { root.recovery("Create backup", "", ""); } }
-                    Button { text: "Refresh backup and job status"; clicked => { root.recovery("Refresh", "", ""); } }
-                }
-                backup-id := LineEdit { placeholder-text: "Backup ID from the list below"; }
-                confirmation := LineEdit { placeholder-text: "To restore, type RESTORE BACKUP (requires restart)"; }
-                HorizontalBox {
-                    Button { text: "Validate backup"; clicked => { root.recovery("Validate backup", backup-id.text, ""); } }
-                    Button { text: "Restore backup"; enabled: confirmation.text == "RESTORE BACKUP" && backup-id.text != ""; clicked => { root.recovery("Restore backup", backup-id.text, confirmation.text); } }
-                }
-                ScrollView { min-height: 100px; Text { text: root.recovery-status; wrap: word-wrap; } }
+            ScrollView { min-height: 100px; content-y <=> root.manage-settings-scroll-y; VerticalBox { Text { text: root.manage-status; wrap: word-wrap; } Rectangle { vertical-stretch: 1; } } }
+            ScrollView { min-height: 100px; content-y <=> root.manage-log-scroll-y; VerticalBox { Text { text: root.diagnostic-log; wrap: word-wrap; } Rectangle { vertical-stretch: 1; } } }
             }
         }
         Text { text: root.status; wrap: word-wrap; }
@@ -242,33 +469,118 @@ export component CuratorNativeWindow inherits Window {
     // so Save and Cancel stay reachable on compact displays.
     if root.settings-open: Rectangle {
         x: 32px; y: 32px; width: parent.width - 64px; height: parent.height - 64px;
-        background: #202633; border-radius: 10px; border-width: 1px; border-color: #8b98b3;
+        background: root.theme-panel; border-radius: 10px; border-width: 1px; border-color: root.theme-line;
         VerticalBox {
             padding: 18px; spacing: 10px;
-            Text { text: "Settings"; font-size: 24px; font-weight: 700; color: #f3f6fc; }
-            ScrollView {
-                vertical-stretch: 1;
+            Text { text: "Settings"; font-size: 24px; font-weight: 700; color: root.theme-text; }
+            HorizontalBox {
+                vertical-stretch: 1; spacing: 12px;
                 VerticalBox {
-                    spacing: 10px;
-                    Text { text: "General"; font-size: 18px; color: #f3f6fc; }
-                    tray := CheckBox { text: "Keep Curator running in the tray"; checked: root.settings-tray; enabled: root.local-host; }
-                    Text { text: "Media & Storage"; font-size: 18px; color: #f3f6fc; }
-                    Text { text: "Download and cache limits are enforced by the Host service."; wrap: word-wrap; color: #d5dced; }
-                    Text { text: "Appearance"; font-size: 18px; color: #f3f6fc; }
-                    theme-value := LineEdit { text: root.settings-theme; placeholder-text: "Theme"; }
-                    layout-value := ComboBox { model: ["grid", "table"]; current-value: root.settings-layout; }
-                    Text { text: "Playback & GOON"; font-size: 18px; color: #f3f6fc; }
-                    Text { text: "Playback, session, speech, and soundtrack preferences are retained by the service."; wrap: word-wrap; color: #d5dced; }
-                    Text { text: "Automation"; font-size: 18px; color: #f3f6fc; }
-                    Text { text: "Classification remains opt-in and reports blocked dependencies in Local Admin."; wrap: word-wrap; color: #d5dced; }
-                    if root.local-host: Text { text: "Local Admin"; font-size: 18px; color: #f3f6fc; }
-                    if root.local-host: Text { text: "Backups, recovery, and diagnostics are available on Manage."; wrap: word-wrap; color: #d5dced; }
+                    width: 178px; spacing: 5px;
+                    for section[index] in ["General", "Media & Storage", "Appearance", "Playback & GOON", "Automation", "Local Admin"]: Button {
+                        text: section;
+                        visible: index != 5 || root.local-host;
+                        primary: root.settings-page == index;
+                        clicked => { root.settings-page = index; }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+                if root.settings-page == 0: ScrollView {
+                    horizontal-stretch: 1; content-y <=> root.settings-general-scroll-y;
+                    VerticalBox {
+                        spacing: 10px; alignment: start;
+                        Text { vertical-stretch: 0; text: "General"; font-size: 18px; color: root.theme-text; }
+                        if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Keep Curator running in the tray"; checked <=> root.settings-draft-tray; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Concurrent downloads (1–20)"; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-concurrent; placeholder-text: "1–20"; }
+                        if !root.local-host: Text { vertical-stretch: 0; text: "Viewer device preferences are saved here. Host settings remain on the Host."; wrap: word-wrap; color: root.theme-muted; }
+                    }
+                }
+                if root.settings-page == 1: ScrollView {
+                    horizontal-stretch: 1; content-y <=> root.settings-media-scroll-y;
+                    VerticalBox {
+                        spacing: 10px; alignment: start;
+                        Text { vertical-stretch: 0; text: "Media & Storage"; font-size: 18px; color: root.theme-text; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Maximum download file size in bytes (blank: unlimited)"; wrap: word-wrap; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-max-file-bytes; placeholder-text: "Unlimited"; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Maximum source storage in bytes (blank: unlimited)"; wrap: word-wrap; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-max-source-bytes; placeholder-text: "Unlimited"; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Minimum free disk bytes before syncing (blank: disabled)"; wrap: word-wrap; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-min-free-bytes; placeholder-text: "Disabled"; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Thumbnail cache limit in bytes (blank: unlimited)"; wrap: word-wrap; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-cache-bytes; placeholder-text: "Unlimited"; }
+                        if !root.local-host: Text { vertical-stretch: 0; text: "Storage limits are managed on the Host."; wrap: word-wrap; color: root.theme-muted; }
+                    }
+                }
+                if root.settings-page == 2: ScrollView {
+                    horizontal-stretch: 1; content-y <=> root.settings-appearance-scroll-y;
+                    VerticalBox {
+                        spacing: 10px; alignment: start;
+                        Text { vertical-stretch: 0; text: "Appearance"; font-size: 18px; color: root.theme-text; }
+                        Text { vertical-stretch: 0; text: "Theme"; color: root.theme-text; }
+                        ComboBox { height: 36px; vertical-stretch: 0; model: ["system", "gtk-system", "adwaita-light", "adwaita-dark", "yaru-light", "yaru-dark", "arc-light", "arc-dark", "breeze-light", "breeze-dark", "atelier-dark", "midnight", "ember", "linen", "sage", "aurora", "oled", "yotsuba", "yotsuba-b", "futaba", "burichan", "tomorrow", "photon", "light", "oled-dark", "dark"]; current-value <=> root.settings-draft-theme; }
+                        Text { vertical-stretch: 0; text: "Library layout"; color: root.theme-text; }
+                        ComboBox { height: 36px; vertical-stretch: 0; model: ["grid", "table"]; current-value <=> root.settings-draft-layout; }
+                    }
+                }
+                if root.settings-page == 3: ScrollView {
+                    horizontal-stretch: 1; content-y <=> root.settings-playback-scroll-y;
+                    VerticalBox {
+                        spacing: 10px; alignment: start;
+                        Text { vertical-stretch: 0; text: "Playback & GOON"; font-size: 18px; color: root.theme-text; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Slideshow interval in milliseconds (500–60000)"; wrap: word-wrap; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-slideshow-ms; placeholder-text: "3000"; }
+                        if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Loop slideshow"; checked <=> root.settings-draft-slideshow-loop; }
+                        if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Shuffle slideshow"; checked <=> root.settings-draft-slideshow-shuffle; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Maximum clip length in seconds (5–3600)"; wrap: word-wrap; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-max-clip-seconds; placeholder-text: "60"; }
+                        if root.local-host: CheckBox { height: 36px; vertical-stretch: 0; text: "Enable metronome"; checked <=> root.settings-draft-metronome; }
+                        Text { vertical-stretch: 0; text: "Player mode and session controls are available in the Player workspace."; wrap: word-wrap; color: root.theme-muted; }
+                    }
+                }
+                if root.settings-page == 4: ScrollView {
+                    horizontal-stretch: 1; content-y <=> root.settings-automation-scroll-y;
+                    VerticalBox {
+                        spacing: 10px; alignment: start;
+                        Text { vertical-stretch: 0; text: "Automation"; font-size: 18px; color: root.theme-text; }
+                        if root.local-host: Text { vertical-stretch: 0; text: "Export reminder interval in days (1–365)"; wrap: word-wrap; color: root.theme-text; }
+                        if root.local-host: LineEdit { height: 36px; vertical-stretch: 0; text <=> root.settings-draft-reminder-days; placeholder-text: "30"; }
+                        Text { vertical-stretch: 0; text: "Classification is opt-in. Dependency and model availability are shown in Local Admin."; wrap: word-wrap; color: root.theme-muted; }
+                    }
+                }
+                if root.settings-page == 5 && root.local-host: ScrollView {
+                    horizontal-stretch: 1; content-y <=> root.settings-admin-scroll-y;
+                    VerticalBox {
+                        spacing: 10px; alignment: start;
+                        Text { vertical-stretch: 0; text: "Local Admin"; font-size: 18px; color: root.theme-text; }
+                        Text { vertical-stretch: 0; text: root.manage-status; wrap: word-wrap; color: root.theme-muted; }
+                        Text { vertical-stretch: 0; text: "Backups and recovery"; font-size: 18px; color: root.theme-text; }
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            Button { text: "Create backup"; enabled: !root.busy; clicked => { root.recovery("Create backup", "", ""); } }
+                            Button { text: "Refresh jobs"; clicked => { root.recovery("Refresh", "", ""); } }
+                        }
+                        ComboBox { height: 36px; vertical-stretch: 0; model: root.recovery-backups; current-index <=> root.recovery-selected-backup; enabled: root.recovery-has-backups; }
+                        HorizontalBox {
+                            vertical-stretch: 0;
+                            Button { text: "Validate selected backup"; enabled: root.recovery-has-backups && !root.busy; clicked => { root.recovery("Validate backup", "", ""); } }
+                            Button { text: "Restore selected backup"; enabled: root.recovery-has-backups && root.manage-confirmation == "RESTORE BACKUP" && !root.busy; clicked => { root.recovery("Restore backup", "", root.manage-confirmation); } }
+                        }
+                        LineEdit { height: 36px; vertical-stretch: 0; placeholder-text: "Type RESTORE BACKUP to restore (restart required)"; text <=> root.manage-confirmation; }
+                        Text { vertical-stretch: 0; text: "Maintenance"; font-size: 18px; color: root.theme-text; }
+                        ComboBox { height: 36px; vertical-stretch: 0; model: ["Reconcile library", "Clear human ratings", "Reset ratings and evidence", "Flatten groups", "Delete groups", "Clear tag assignments", "Clear session history", "Rebuild caches", "Factory reset", "Remove P-HAR", "Remove archives"]; current-value <=> root.maintenance-action; }
+                        Text { vertical-stretch: 0; text: root.maintenance-required-phrase == "" ? "This action needs no confirmation phrase." : "Type " + root.maintenance-required-phrase + " to run this action."; wrap: word-wrap; color: root.theme-muted; }
+                        LineEdit { height: 36px; vertical-stretch: 0; placeholder-text: "Confirmation phrase"; text <=> root.maintenance-confirmation; }
+                        Button { text: "Run maintenance"; enabled: !root.busy && (root.maintenance-required-phrase == "" || root.maintenance-confirmation == root.maintenance-required-phrase); clicked => { root.recovery(root.maintenance-action, "", root.maintenance-confirmation); } }
+                        Text { vertical-stretch: 0; text: root.recovery-status; wrap: word-wrap; color: root.theme-text; }
+                    }
                 }
             }
             HorizontalBox {
-                Rectangle { horizontal-stretch: 1; }
-                Button { text: "Cancel"; clicked => { root.settings-open = false; } }
-                Button { text: "Save"; primary: true; enabled: !root.busy; clicked => { root.save-settings(theme-value.text, tray.checked, layout-value.current-value); root.settings-open = false; } }
+                if root.settings-error != "": Text { text: root.settings-error; wrap: word-wrap; color: #ff8a80; horizontal-stretch: 1; }
+                if root.settings-error == "": Rectangle { horizontal-stretch: 1; }
+                Button { text: "Cancel"; enabled: !root.settings-saving; clicked => { root.settings-open = false; } }
+                Button { text: root.settings-saving ? "Saving…" : "Save"; primary: true; enabled: !root.busy && !root.settings-saving; clicked => { if root.save-settings() { root.settings-open = false; } } }
             }
         }
     }

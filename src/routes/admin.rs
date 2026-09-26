@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 
-use crate::maintenance::{self, MaintenanceKind, MaintenanceRequest};
+use crate::maintenance::{MaintenanceKind, MaintenanceRequest};
 use crate::phar::{self, PharBackend};
 use crate::AppState;
 
@@ -40,8 +40,14 @@ fn local_only(
     }
 }
 
-fn job_error(error: String) -> (StatusCode, Json<Value>) {
-    (StatusCode::CONFLICT, Json(json!({"error": error})))
+fn job_error(error: crate::services::jobs::JobError) -> (StatusCode, Json<Value>) {
+    let status = match error {
+        crate::services::jobs::JobError::Forbidden => StatusCode::FORBIDDEN,
+        crate::services::jobs::JobError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+        crate::services::jobs::JobError::NotFound => StatusCode::NOT_FOUND,
+        crate::services::jobs::JobError::Rejected(_) => StatusCode::CONFLICT,
+    };
+    (status, Json(json!({"error": error.message()})))
 }
 
 pub async fn list_jobs(
@@ -49,7 +55,9 @@ pub async fn list_jobs(
     peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    Ok(Json(json!({"jobs": state.maintenance.jobs().await})))
+    Ok(Json(
+        json!({"jobs": crate::services::jobs::list(&state).await.map_err(job_error)?}),
+    ))
 }
 
 pub async fn get_job(
@@ -58,17 +66,10 @@ pub async fn get_job(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    state
-        .maintenance
-        .job(&id)
+    let job = crate::services::jobs::get(&state, &id)
         .await
-        .map(|job| Json(json!(job)))
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error":"Maintenance job not found."})),
-            )
-        })
+        .map_err(job_error)?;
+    Ok(Json(json!(job)))
 }
 
 pub async fn start_job(
@@ -77,9 +78,7 @@ pub async fn start_job(
     Json(request): Json<MaintenanceRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    let job = state
-        .maintenance
-        .start(Arc::clone(&state), request)
+    let job = crate::services::jobs::start(state, request)
         .await
         .map_err(job_error)?;
     Ok(Json(json!(job)))
@@ -90,18 +89,16 @@ pub async fn create_backup(
     peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    let job = state
-        .maintenance
-        .start(
-            Arc::clone(&state),
-            MaintenanceRequest {
-                kind: MaintenanceKind::CreateBackup,
-                confirmation: String::new(),
-                backup_id: None,
-            },
-        )
-        .await
-        .map_err(job_error)?;
+    let job = crate::services::jobs::start(
+        state,
+        MaintenanceRequest {
+            kind: MaintenanceKind::CreateBackup,
+            confirmation: String::new(),
+            backup_id: None,
+        },
+    )
+    .await
+    .map_err(job_error)?;
     Ok(Json(json!(job)))
 }
 
@@ -110,10 +107,19 @@ pub async fn list_backups(
     peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    let backups = maintenance::list_backups(&state.data_dir).map_err(|error| {
+    let backups = crate::services::backup::list(&state).map_err(|error| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
+            match &error {
+                crate::services::backup::BackupError::Forbidden => StatusCode::FORBIDDEN,
+                crate::services::backup::BackupError::ShuttingDown => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                crate::services::backup::BackupError::InvalidId(_) => StatusCode::NOT_FOUND,
+                crate::services::backup::BackupError::ReadFailed(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            },
+            Json(json!({"error": error.message()})),
         )
     })?;
     Ok(Json(json!({"backups": backups})))
@@ -127,12 +133,21 @@ pub async fn download_backup(
     if let Err(error) = local_only(&state, &peer) {
         return error.into_response();
     }
-    let path = match maintenance::backup_file(&state.data_dir, &id) {
+    let path = match crate::services::backup::download_path(&state, &id) {
         Ok(path) => path,
         Err(error) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": error.to_string()})),
+                match error {
+                    crate::services::backup::BackupError::Forbidden => StatusCode::FORBIDDEN,
+                    crate::services::backup::BackupError::ShuttingDown => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    crate::services::backup::BackupError::InvalidId(_) => StatusCode::NOT_FOUND,
+                    crate::services::backup::BackupError::ReadFailed(_) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                },
+                Json(json!({"error": error.message()})),
             )
                 .into_response()
         }
@@ -167,18 +182,16 @@ pub async fn validate_backup(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    let job = state
-        .maintenance
-        .start(
-            Arc::clone(&state),
-            MaintenanceRequest {
-                kind: MaintenanceKind::ValidateBackup,
-                confirmation: String::new(),
-                backup_id: Some(id),
-            },
-        )
-        .await
-        .map_err(job_error)?;
+    let job = crate::services::jobs::start(
+        state,
+        MaintenanceRequest {
+            kind: MaintenanceKind::ValidateBackup,
+            confirmation: String::new(),
+            backup_id: Some(id),
+        },
+    )
+    .await
+    .map_err(job_error)?;
     Ok(Json(json!(job)))
 }
 
@@ -194,18 +207,16 @@ pub async fn restore_backup(
     Json(body): Json<RestoreBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     local_only(&state, &peer)?;
-    let job = state
-        .maintenance
-        .start(
-            Arc::clone(&state),
-            MaintenanceRequest {
-                kind: MaintenanceKind::RestoreBackup,
-                confirmation: body.confirmation,
-                backup_id: Some(id),
-            },
-        )
-        .await
-        .map_err(job_error)?;
+    let job = crate::services::jobs::start(
+        state,
+        MaintenanceRequest {
+            kind: MaintenanceKind::RestoreBackup,
+            confirmation: body.confirmation,
+            backup_id: Some(id),
+        },
+    )
+    .await
+    .map_err(job_error)?;
     Ok(Json(json!(job)))
 }
 

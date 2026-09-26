@@ -26,6 +26,7 @@ pub struct SystemInfo {
     pub api_protocol: &'static str,
     pub instance_id: String,
     pub capabilities: SystemCapabilities,
+    pub viewer_permissions: crate::native::ViewerPermissions,
     pub tailnet_only: bool,
 }
 
@@ -44,6 +45,7 @@ impl SystemInfo {
                 background_service: matches!(state.edition, crate::edition::Edition::Server),
                 local_admin: state.edition.has_local_admin(),
             },
+            viewer_permissions: crate::native::ViewerPermissions::default(),
             tailnet_only: true,
         }
     }
@@ -65,5 +67,7 @@ mod tests {
         assert!(text.contains("test-instance"));
         assert!(!text.contains(&dir.path().to_string_lossy().to_string()));
         assert!(text.contains(API_PROTOCOL));
+        assert!(text.contains("\"viewer_permissions\""));
+        assert!(text.contains("\"library_edit\":false"));
     }
 }

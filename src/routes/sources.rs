@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use crate::db::now_iso;
 use crate::downloader::run_download;
 use crate::routes::media::db_err;
-use crate::slug::{derive_name_from_url, normalize_for_compare, slugify, split_bulk_input};
+use crate::services::sources::row_to_json;
+use crate::slug::split_bulk_input;
 use crate::AppState;
 
 // ─── Models ───────────────────────────────────────────────────────────────────
@@ -395,116 +396,20 @@ pub async fn create_sources_from_urls(
     state: Arc<AppState>,
     candidates: Vec<String>,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
-    let mut normalized: Vec<String> = Vec::new();
-    let mut seen_norm = std::collections::HashSet::new();
-    for c in candidates {
-        let u = crate::url_guard::normalize_public_http_url(&c)
-            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))))?;
-        if !seen_norm.contains(&u) {
-            seen_norm.insert(u.clone());
-            normalized.push(u);
-        }
-    }
-    if normalized.is_empty() {
-        return Ok(json!({ "sources": [], "duplicates": [] }));
-    }
-
-    let conn = state.pool.get().map_err(db_err)?;
-    let existing: std::collections::HashMap<String, String> = {
-        let mut stmt = conn
-            .prepare("SELECT url, name FROM sources")
-            .map_err(db_err)?;
-        let out = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .map_err(db_err)?
-            .filter_map(|r| r.ok())
-            .map(|(url, name)| (normalize_for_compare(&url), name))
-            .collect();
-        out
-    };
-
-    let mut to_create: Vec<String> = Vec::new();
-    let mut duplicates: Vec<Value> = Vec::new();
-    let mut existing = existing;
-
-    for url in &normalized {
-        let key = normalize_for_compare(url);
-        if let Some(name) = existing.get(&key) {
-            duplicates.push(json!({ "url": url, "name": name }));
-        } else {
-            existing.insert(key, String::new());
-            to_create.push(url.clone());
-        }
-    }
-
-    let mut created_ids: Vec<i64> = Vec::new();
-    for url in &to_create {
-        let name = derive_name_from_url(url);
-        let base_slug = slugify(&name);
-        conn.execute(
-            "INSERT INTO sources (name, url, slug, status, added_at, queued_at, progress_updated_at) VALUES (?1,?2,?3,'pending',?4,?4,?4)",
-            rusqlite::params![name, url, base_slug, now_iso()],
-        ).map_err(db_err)?;
-        let source_id = conn.last_insert_rowid();
-        conn.execute(
-            "UPDATE sources SET slug=?1 WHERE id=?2",
-            rusqlite::params![format!("{}-{}", source_id, base_slug), source_id],
-        )
-        .map_err(db_err)?;
-        created_ids.push(source_id);
-    }
-
-    for &id in &created_ids {
-        // Keep created sources in the same bounded/shutdown-aware task tracker
-        // as resyncs and retries.  A raw detached task could outlive the
-        // server and would not be awaited during desktop shutdown.
-        state
-            .download_tasks
-            .spawn(run_download(Arc::clone(&state), id));
-    }
-
-    let sources: Vec<Value> = if !created_ids.is_empty() {
-        let placeholders = created_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!("SELECT * FROM sources WHERE id IN ({})", placeholders);
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-        let params: Vec<&dyn rusqlite::ToSql> = created_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        let out = stmt
-            .query_map(params.as_slice(), row_to_json)
-            .map_err(db_err)?
-            .filter_map(|r| r.ok())
-            .collect();
-        out
-    } else {
-        Vec::new()
-    };
-
-    Ok(json!({ "sources": sources, "duplicates": duplicates }))
-}
-
-// ─── Row → serde_json::Value helper ──────────────────────────────────────────
-
-fn row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    let count = row.as_ref().column_count();
-    let mut map = serde_json::Map::new();
-    for i in 0..count {
-        let name = row.as_ref().column_name(i).unwrap_or("?").to_string();
-        let val: Value = match row.get_ref(i)? {
-            rusqlite::types::ValueRef::Null => Value::Null,
-            rusqlite::types::ValueRef::Integer(n) => json!(n),
-            rusqlite::types::ValueRef::Real(f) => json!(f),
-            rusqlite::types::ValueRef::Text(s) => json!(std::str::from_utf8(s).unwrap_or("")),
-            rusqlite::types::ValueRef::Blob(b) => json!(std::str::from_utf8(b).unwrap_or("")),
+    let result = crate::services::sources::create(state, candidates).map_err(|error| {
+        let status = match error {
+            crate::services::sources::SourceError::Forbidden => StatusCode::FORBIDDEN,
+            crate::services::sources::SourceError::ShuttingDown
+            | crate::services::sources::SourceError::MaintenanceActive => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            crate::services::sources::SourceError::InvalidInput(_)
+            | crate::services::sources::SourceError::InvalidUrl(_) => StatusCode::BAD_REQUEST,
+            crate::services::sources::SourceError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        map.insert(name, val);
-    }
-    Ok(Value::Object(map))
+        (status, Json(json!({"error": error.message()})))
+    })?;
+    Ok(serde_json::to_value(result).expect("serializable source result"))
 }
 
 #[cfg(test)]

@@ -23,44 +23,7 @@ use serde_json::{json, Value};
 use crate::routes::media::db_err;
 use crate::AppState;
 
-/// Public provider metadata.  Providers are visible even when gallery-dl is
-/// too old, a remote site is unavailable, or the site needs login cookies.
-/// That gives the UI an honest explanation instead of silently disappearing.
-#[derive(Debug, Clone, Serialize)]
-pub struct ProviderDescriptor {
-    pub id: String,
-    pub name: String,
-    pub capabilities: Vec<String>,
-    pub authentication_required: bool,
-    pub availability: String,
-    pub generated: bool,
-    pub curated: bool,
-    pub result_types: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub search_template: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderRegistry {
-    pub providers: Vec<ProviderDescriptor>,
-    pub gallery_dl_version: Option<String>,
-}
-
-impl ProviderRegistry {
-    pub fn descriptor(&self, id: &str) -> Option<&ProviderDescriptor> {
-        let normalized = if id == "gallery-dl" { "local" } else { id };
-        self.providers
-            .iter()
-            .find(|provider| provider.id == normalized)
-    }
-
-    pub fn ids(&self) -> HashSet<String> {
-        self.providers
-            .iter()
-            .map(|provider| provider.id.clone())
-            .collect()
-    }
-}
+pub use crate::services::discovery::{ProviderDescriptor, ProviderRegistry};
 
 fn descriptor(
     id: &str,
@@ -983,10 +946,10 @@ fn direct_url_result(query: &str) -> Option<SearchResult> {
 /// GET /api/search/providers.  The registry is built at startup from the
 /// installed gallery-dl version plus Curator's curated overlay.
 pub async fn providers(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({
-        "providers": state.search_registry.providers,
-        "gallery_dl_version": state.search_registry.gallery_dl_version,
-    }))
+    Json(match crate::services::discovery::providers(&state) {
+        Ok(catalog) => serde_json::to_value(catalog).unwrap_or_default(),
+        Err(error) => json!({"error":error}),
+    })
 }
 
 fn requested_provider_ids(query: &SearchQuery, defaults: &[String]) -> Vec<String> {
